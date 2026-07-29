@@ -1,0 +1,271 @@
+# AuthGraph security model
+
+## Status and intended use
+
+AuthGraph currently demonstrates a cryptographic and authorization boundary
+using synthetic records. It does not by itself make any product safe,
+compliant, or suitable as an authoritative system of record. Architecture
+alone cannot establish GDPR, HIPAA, PCI DSS, or other legal or industry
+compliance.
+
+## Security goals
+
+1. A stolen Neo4j data store or backup does not reveal encrypted semantic
+   entity types, relationship types, or properties without a vault secret.
+2. A principal can retrieve records only from the vault bound to that
+   principal's secure session.
+3. A passphrase, KEK, DEK, Neo4j credential, or session token never enters an
+   LLM prompt, tool argument, graph property, application log, or audit event.
+4. Unlocking one vault never globally decrypts Neo4j.
+5. Modification or truncation of a present ciphertext, record swapping, or
+   cross-vault movement fails authenticated decryption.
+6. Expiry, logout, password change, and session revocation prevent the affected
+   session from obtaining a new DEK lease in the supported single-process
+   design. Session revocation does not disable a future password unlock.
+
+## Non-goals and unavoidable leakage
+
+Application encryption is not magic searchable encryption.
+
+Neo4j can see:
+
+- opaque principal, vault, entity, and relationship identifiers;
+- that entities belong to the same vault;
+- generic connectivity, direction, graph size, and access patterns;
+- ciphertext sizes and key/KDF version metadata; and
+- database operational metadata.
+
+Neo4j cannot use randomized ciphertext for meaningful full-text, range, or
+vector similarity search. A future per-vault blind index could support a small
+number of carefully selected exact matches, but it would leak equality.
+Embeddings are sensitive derivatives and cannot remain conventionally
+encrypted while also supporting ordinary vector search.
+
+A compromised trusted broker can capture active DEKs and plaintext. Encryption
+cannot protect data from the component that is currently authorized to decrypt
+it. Production must minimize, isolate, patch, monitor, and egress-restrict that
+trusted computing base.
+
+AES-GCM authenticates a record that is present; it does not prove completeness
+or freshness. An attacker able to delete rows can cause unavailable or partial
+results. An attacker able to restore an entire older, internally consistent
+Neo4j snapshot can replay an old envelope and records. The authenticated
+envelope revision and compare-and-swap prevent normal concurrent lost updates,
+but a revision stored in the same rollback domain cannot detect malicious
+snapshot rollback. Strong anti-rollback protection needs a monotonic version or
+transparency record in a trusted system outside Neo4j and its backups.
+
+Managed runtimes such as Python cannot guarantee complete memory zeroization.
+This prototype overwrites mutable buffers on a best-effort basis, never
+serializes raw DEKs, and intentionally locks all vaults on process restart.
+
+## Key hierarchy
+
+For each vault:
+
+1. Generate a random 256-bit DEK.
+2. Accept a strong passphrase through a dedicated non-chat security interface.
+3. Generate a unique 128-bit salt.
+4. Derive a 256-bit KEK with Argon2id.
+5. Wrap the DEK using AES-256-GCM and AAD containing the principal, vault,
+   envelope format version, envelope revision, and key version.
+6. Store only the salt, KDF parameters, wrap nonce, wrapped DEK, and versions.
+7. Encrypt each entity and relationship independently with the random DEK,
+   a fresh nonce, and object-specific AAD.
+
+AuthGraph does not persist the password. Password change unwraps the DEK using
+the old password and re-wraps it using the new one. The caller still owns the
+input buffer and must dispose of it after the call.
+
+Re-wrapping is not cryptographic recovery from compromise. Anyone who copied
+the old DEK can decrypt old and future records while the vault keeps using that
+DEK, regardless of a later passphrase change. Suspected passphrase, envelope,
+or DEK compromise requires generating a new DEK and re-encrypting every vault
+record; that rotation workflow is not implemented in this prototype.
+
+This has two important consequences:
+
+- A stolen envelope permits offline password guesses. Argon2id slows guessing
+  but cannot make a weak password safe. Authentication rate limiting does not
+  stop offline attacks. A production design should consider a second
+  server/HSM-controlled factor.
+- With no recovery wrap, losing the password or corrupting envelope metadata
+  permanently loses the data. A break-glass or recovery key is a product,
+  governance, and legal decision—not something to improvise later.
+
+## Owner and delegated access
+
+The current MVP has one opaque owner principal per vault. It does not yet
+implement delegated access for another user, employee, administrator, family
+member, service account, or organization.
+
+A production multi-user design should not make different people share one
+password. Instead, the same vault DEK should be wrapped independently for each
+authorized principal, normally using managed organization keys or public-key
+credentials. Authorization and key slots must both be revoked. Strong
+revocation may also require rotating the vault DEK.
+
+The identity-provider subject-to-owner mapping should remain outside Neo4j.
+Do not use names, emails, government identifiers, customer/account numbers, or
+other PII as `principal_id` or `vault_id`.
+
+## Unlock and session flow
+
+```text
+1. User authenticates to the application, preferably with MFA/passkeys.
+2. Chat receives only an `unlock_required` state.
+3. A dedicated password form posts directly to the key broker over TLS.
+4. The broker retrieves the key envelope using the authenticated principal
+   and opaque vault ID.
+5. Argon2id derives a transient KEK; AES-GCM unwraps the vault DEK.
+6. Temporary mutable KEK/DEK buffers owned by the broker are cleared
+   best-effort. The HTTP/caller layer is responsible for disposing of its
+   passphrase input buffer.
+7. The DEK enters a short-lived in-memory session bound to principal + vault.
+8. The browser receives a high-entropy opaque cookie, never the DEK.
+9. Every fixed graph operation obtains its vault scope from that server
+   session, not from user text or model-selected arguments.
+10. Logout, timeout, password change, revocation, or restart prevents a future
+    operation from acquiring a session key lease.
+```
+
+Expiry is enforced synchronously whenever a token asks for a lease. The broker
+also sweeps and best-effort zeroes expired resident DEKs every second by
+default, and removes them opportunistically on another session open. The sweep
+interval is bounded between 10 milliseconds and 60 seconds to prevent both a
+tight-loop configuration and unbounded post-expiry residency; disabling it is
+intended only for deterministic tests. If the worker fails unexpectedly, the
+broker records a health flag, stops new work, drains guarded operations, and
+clears all resident session keys. A production host must monitor
+`sweeper_failed` and use the broker as a context manager or call `close_all()`
+during graceful shutdown. Shutdown stops admission, waits for guarded
+in-flight work, stops the sweeper, and clears resident DEKs. A DEK copy already
+leased to an in-flight operation may live until that operation's `finally`
+block completes. Local lifecycle operations do not preempt that work; the
+vault guard makes logout or password change wait until it finishes.
+
+The local striped lock, envelope compare-and-swap, and broker revision fence
+close password-change races inside one process, including multiple service
+objects sharing that broker. Separate brokers in separate replicas do not
+share revision state. A production multi-replica deployment therefore needs a
+hardened shared broker or distributed fencing/revocation protocol.
+The prototype also places a configurable hard cap on tracked vault revisions
+and fails closed when full; production should keep this authority in bounded,
+durable shared state.
+
+A future HTTP layer must use `Secure`, `HttpOnly`, and appropriate `SameSite`
+cookies, CSRF protection, session rotation, a strict content-security policy,
+and no credential storage in browser `localStorage` or `sessionStorage`.
+
+## Neo4j complete mediation
+
+All repository operations require both `principal_id` and `vault_id`. Every
+Neo4j query:
+
+- is a fixed application template;
+- uses parameters rather than string concatenation;
+- starts from the owned `AGVault`;
+- matches the session's authenticated envelope revision on every entity,
+  relationship, and neighborhood operation;
+- requires every entity and link to carry the same vault scope; and
+- returns only ciphertext and opaque metadata.
+
+The service verifies both edge endpoints inside the same vault. It intentionally
+uses generic `AGEntity` and `AG_LINK` semantics so a database reader cannot see
+plaintext labels such as `PrivateCategory`, `SensitiveEvent`, or `RELATED_TO`.
+
+The adapter treats an exact row already present after a zero-row write or
+`IncompleteCommit` as a successful retry. If it cannot verify the exact row,
+the ambiguous error is propagated rather than silently generating another ID.
+A future HTTP/API layer still needs an idempotency key for each logical create
+request; retrying the whole service call otherwise generates a new ID. The
+schema also requires globally unique entity and relationship IDs.
+
+Protected writes take an explicit temporary-property lock on the vault before
+reading its envelope revision. This is required because Neo4j's default
+read-committed isolation does not by itself make a revision predicate a
+compare-and-swap. The temporary property is removed in the same transaction.
+
+The portable schema contains uniqueness constraints. Missing properties are
+not covered by uniqueness, and `IF NOT EXISTS` may be blocked by a conflicting
+same-named constraint. Deployment must verify the exact result with
+`SHOW CONSTRAINTS`, prevent all untrusted direct graph writes, and use
+Enterprise existence/key constraints where available.
+
+Neo4j/Aura storage encryption, TLS, RBAC, PBAC, private networking, backups,
+and audit controls remain important defense in depth. They are not a
+replacement for this application encryption. Current Neo4j documentation also
+notes that fine-grained controls are tier-dependent. The adapter rejects a
+driver whose `encrypted` property is not explicitly true; production should
+still use trusted-certificate verification such as `neo4j+s`.
+
+## Future AI integration contract
+
+The AI must have:
+
+- no database driver or Neo4j credentials;
+- no passphrase, KEK, DEK, vault ID, or session capability;
+- no arbitrary Cypher or generic graph-query tool;
+- no ability to select the owner security scope;
+- only narrow read-only operations such as `get_my_order_timeline`;
+- bounded results; and
+- retrieved records treated as untrusted content that cannot issue commands.
+
+The trusted tool executor attaches principal and vault scope out of band. It
+decrypts only the selected result and returns the minimum necessary fields.
+
+An external LLM necessarily sees those returned plaintext fields. Turning off
+"memory" does not cryptographically prove that a model provider kept no logs.
+For regulated data, review the exact model provider, region, retention,
+training policy, subprocessors, and required contracts such as a DPA or BAA
+when applicable. If zero sensitive plaintext may leave the trusted boundary,
+use a local/on-premises model or deterministic output.
+
+## Tests required before real data
+
+The included unit tests cover the first layer:
+
+- cross-owner guessed-ID and forged-principal denial;
+- ciphertext-only semantic storage;
+- wrong-password behavior;
+- synchronous expiry, background expired-key sweeping, and explicit lock;
+- ciphertext tampering and object-swapping detection;
+- encrypted relationship round trips;
+- password re-wrapping and session revocation;
+- compare-and-swap envelope updates and a forced stale-unlock race;
+- invalid/non-finite TTL rejection and strict storage-metadata decoding;
+- in-flight lifecycle serialization, concurrent shutdown/key-zeroization
+  ordering, fail-closed sweeper failure, and stale-replica repository
+  fencing; and
+- fixed, vault-scoped Neo4j query templates.
+
+Production also needs:
+
+- property/fuzz tests for every URL, body, nested traversal, search, export,
+  batch operation, and error path;
+- nonce uniqueness under concurrency, retries, and process failure;
+- session fixation, replay, cookie theft, CSRF, XSS, logout, and restart tests;
+- authorization and key-slot grant/revoke tests;
+- log, trace, analytics, crash report, and model-payload redaction assertions;
+- prompt-injection tests using malicious text stored in graph records;
+- backup/restore and key-loss drills;
+- deletion and whole-snapshot rollback detection using an external trusted
+  revision source;
+- KDF performance calibration and unlock denial-of-service protection;
+- live Neo4j two-vault, constraint, transient-retry, and malformed/orphan data
+  integration tests; and
+- independent security and privacy assessment.
+
+## Primary references
+
+- [Neo4j Aura encryption](https://neo4j.com/docs/aura/security/encryption/)
+- [Neo4j property-based access control](https://neo4j.com/docs/operations-manual/current/authentication-authorization/property-based-access-control/)
+- [Neo4j Python query parameters](https://neo4j.com/docs/python-manual/current/query-simple/)
+- [Neo4j concurrent data access and explicit locking](https://neo4j.com/docs/operations-manual/current/database-internals/concurrent-data-access/)
+- [Neo4j Python connection security](https://neo4j.com/docs/python-manual/current/connect-advanced/)
+- [Neo4j Python driver exceptions](https://neo4j.com/docs/api/python-driver/current/api.html#neo4j.exceptions.IncompleteCommit)
+- [RFC 9106: Argon2](https://www.rfc-editor.org/rfc/rfc9106.html)
+- [NIST SP 800-38D: GCM](https://csrc.nist.gov/pubs/sp/800/38/d/final)
+- [OWASP Cryptographic Storage Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Cryptographic_Storage_Cheat_Sheet.html)
+- [OWASP Password Storage Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html)
+- [OWASP Session Management Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html)

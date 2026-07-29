@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "authgraph"
+version = "0.1.0"
+description = "An owner-scoped encrypted knowledge graph security layer for Neo4j"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [
+  { name = "Benjamin Begovic" },
+]
+dependencies = [
+  "cryptography>=44",
+  "neo4j>=6.2,<7",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
