@@ -185,6 +185,9 @@ Protected writes take an explicit temporary-property lock on the vault before
 reading its envelope revision. This is required because Neo4j's default
 read-committed isolation does not by itself make a revision predicate a
 compare-and-swap. The temporary property is removed in the same transaction.
+The full-vault snapshot query takes the same lock before checking the revision,
+so cooperative writes cannot produce a torn snapshot. The lock has no durable
+semantic effect, but it is held for the transaction.
 
 The portable schema contains uniqueness constraints. Missing properties are
 not covered by uniqueness, and `IF NOT EXISTS` may be blocked by a conflicting
@@ -221,6 +224,21 @@ training policy, subprocessors, and required contracts such as a DPA or BAA
 when applicable. If zero sensitive plaintext may leave the trusted boundary,
 use a local/on-premises model or deterministic output.
 
+The prototype also exposes `get_vault_snapshot()` as a deliberate exception
+for the requested full-vault chatbot test. It is authenticated out of band and
+returns either one complete small vault or an error under fixed count and
+aggregate-ciphertext ceilings. It does not stream partial plaintext and
+AuthGraph does not cache its return value. Once returned, however, all
+decrypted entities and relationships are caller-owned plaintext; passing that
+snapshot to an LLM exposes the whole snapshot to the model environment. This
+high-exposure operation should not be offered as a model-selectable tool, and
+narrow task-specific retrieval remains the production recommendation.
+Its all-or-nothing guarantee covers the rows visible to the scoped repository
+query and the configured bounds. It cannot detect a hostile storage actor that
+deletes a row or removes the label, vault metadata, or ownership edge needed
+to make that row query-visible; that requires an authenticated inventory
+outside the mutable graph.
+
 ## Tests required before real data
 
 The included unit tests cover the first layer:
@@ -231,6 +249,7 @@ The included unit tests cover the first layer:
 - synchronous expiry, background expired-key sweeping, and explicit lock;
 - ciphertext tampering and object-swapping detection;
 - encrypted relationship round trips;
+- bounded all-or-nothing vault snapshots and cross-owner snapshot isolation;
 - password re-wrapping and session revocation;
 - compare-and-swap envelope updates and a forced stale-unlock race;
 - invalid/non-finite TTL rejection and strict storage-metadata decoding;

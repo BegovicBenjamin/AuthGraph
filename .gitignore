@@ -10,3 +10,7 @@ venv/
 dist/
 build/
 .env
+
+# Local-only AuthGraph demo chatbot and its confirmed credential file.
+.local-authgraph-chatbot/
+/i dont know where ever its save

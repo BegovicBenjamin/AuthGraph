@@ -17,6 +17,7 @@ from .models import (
     KdfParameters,
     Neighborhood,
     Relationship,
+    VaultSnapshot,
 )
 from .service import AuthGraphService
 from .sessions import InMemorySessionBroker
@@ -40,4 +41,5 @@ __all__ = [
     "SessionUnavailable",
     "UnlockDenied",
     "ValidationError",
+    "VaultSnapshot",
 ]

@@ -81,6 +81,14 @@ class EncryptedNeighborhoodRow:
 
 
 @dataclass(frozen=True, slots=True)
+class EncryptedVaultSnapshotRow:
+    """A bounded ciphertext snapshot fetched under one vault revision."""
+
+    entities: tuple[EncryptedEntityRow, ...]
+    relationships: tuple[EncryptedRelationshipRow, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class Entity:
     entity_id: str
     kind: str
@@ -100,6 +108,14 @@ class Relationship:
 class Neighborhood:
     center: Entity
     neighbors: tuple[Entity, ...]
+    relationships: tuple[Relationship, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class VaultSnapshot:
+    """Decrypted vault contents that callers must treat as highly sensitive."""
+
+    entities: tuple[Entity, ...]
     relationships: tuple[Relationship, ...]
 
 

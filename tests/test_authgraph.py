@@ -28,6 +28,7 @@ from authgraph.models import (
 )
 from authgraph.crypto import MAX_ACCEPTED_MEMORY_KIB, clear_bytearray
 from authgraph.neo4j_repository import IncompleteCommit, Neo4jGraphRepository
+from authgraph.service import MAX_VAULT_SNAPSHOT_CIPHERTEXT_BYTES
 
 
 class FakeClock:
@@ -686,6 +687,280 @@ class AuthGraphSecurityTests(unittest.TestCase):
         self.assertNotIn("REFERENCES", stored)
         self.assertNotIn("synthetic-item", stored)
 
+    def test_vault_snapshot_returns_complete_graph_including_isolated_entity(
+        self,
+    ) -> None:
+        _, context = self.create_alice()
+        profile = self.service.create_entity(
+            context,
+            "Profile",
+            {
+                "display_name": "Synthetic Alice",
+                "contact": "alice@example.invalid",
+            },
+        )
+        preference = self.service.create_entity(
+            context,
+            "Preference",
+            {"theme": "synthetic-blue"},
+        )
+        isolated = self.service.create_entity(
+            context,
+            "PrivateNote",
+            {"text": "synthetic isolated record"},
+        )
+        relationship = self.service.connect(
+            context,
+            profile,
+            preference,
+            "PREFERS",
+            {"source": "synthetic-test"},
+        )
+
+        snapshot = self.service.get_vault_snapshot(
+            context,
+            entity_limit=3,
+            relationship_limit=1,
+        )
+
+        entities = {entity.entity_id: entity for entity in snapshot.entities}
+        self.assertEqual(set(entities), {profile, preference, isolated})
+        self.assertEqual(entities[profile].kind, "Profile")
+        self.assertEqual(
+            entities[profile].properties["contact"],
+            "alice@example.invalid",
+        )
+        self.assertEqual(entities[isolated].kind, "PrivateNote")
+        self.assertEqual(
+            entities[isolated].properties["text"],
+            "synthetic isolated record",
+        )
+        self.assertEqual(len(snapshot.relationships), 1)
+        self.assertEqual(snapshot.relationships[0].relationship_id, relationship)
+        self.assertEqual(snapshot.relationships[0].from_entity_id, profile)
+        self.assertEqual(snapshot.relationships[0].to_entity_id, preference)
+        self.assertEqual(snapshot.relationships[0].kind, "PREFERS")
+        self.assertEqual(
+            snapshot.relationships[0].properties,
+            {"source": "synthetic-test"},
+        )
+
+    def test_vault_snapshot_supports_an_empty_vault(self) -> None:
+        _, context = self.create_alice()
+
+        snapshot = self.service.get_vault_snapshot(context)
+
+        self.assertEqual(snapshot.entities, ())
+        self.assertEqual(snapshot.relationships, ())
+
+    def test_vault_snapshot_is_owner_isolated(self) -> None:
+        _, alice = self.create_alice()
+        bob_vault = self.service.create_vault(
+            "idp|owner-bob",
+            self.BOB_PASSWORD,
+        )
+        bob = self.service.unlock(
+            "idp|owner-bob",
+            bob_vault,
+            self.BOB_PASSWORD,
+        )
+        alice_entity = self.service.create_entity(
+            alice,
+            "OwnerRecord",
+            {"owner": "synthetic-alice-only"},
+        )
+        bob_entity = self.service.create_entity(
+            bob,
+            "OwnerRecord",
+            {"owner": "synthetic-bob-only"},
+        )
+
+        alice_snapshot = self.service.get_vault_snapshot(alice)
+        bob_snapshot = self.service.get_vault_snapshot(bob)
+
+        self.assertEqual(
+            {entity.entity_id for entity in alice_snapshot.entities},
+            {alice_entity},
+        )
+        self.assertEqual(
+            {entity.properties["owner"] for entity in alice_snapshot.entities},
+            {"synthetic-alice-only"},
+        )
+        self.assertEqual(
+            {entity.entity_id for entity in bob_snapshot.entities},
+            {bob_entity},
+        )
+        self.assertEqual(
+            {entity.properties["owner"] for entity in bob_snapshot.entities},
+            {"synthetic-bob-only"},
+        )
+
+    def test_vault_snapshot_overflow_fails_instead_of_truncating(self) -> None:
+        _, context = self.create_alice()
+        first = self.service.create_entity(context, "Synthetic", {"index": 1})
+        second = self.service.create_entity(context, "Synthetic", {"index": 2})
+        third = self.service.create_entity(context, "Synthetic", {"index": 3})
+        self.service.connect(context, first, second, "LINKS", {"index": 1})
+        self.service.connect(context, second, third, "LINKS", {"index": 2})
+
+        with self.assertRaisesRegex(ValidationError, "complete vault"):
+            self.service.get_vault_snapshot(
+                context,
+                entity_limit=2,
+                relationship_limit=2,
+            )
+        with self.assertRaisesRegex(ValidationError, "complete vault"):
+            self.service.get_vault_snapshot(
+                context,
+                entity_limit=3,
+                relationship_limit=1,
+            )
+
+        complete = self.service.get_vault_snapshot(
+            context,
+            entity_limit=3,
+            relationship_limit=2,
+        )
+        self.assertEqual(len(complete.entities), 3)
+        self.assertEqual(len(complete.relationships), 2)
+
+    def test_vault_snapshot_limits_require_exact_bounded_integers(self) -> None:
+        _, context = self.create_alice()
+        for entity_limit in (0, -1, 101, True, 1.0, "1"):
+            with self.subTest(
+                entity_limit=entity_limit
+            ), self.assertRaises(ValidationError):
+                self.service.get_vault_snapshot(
+                    context,
+                    entity_limit=entity_limit,  # type: ignore[arg-type]
+                )
+        for relationship_limit in (0, -1, 201, True, 1.0, "1"):
+            with self.subTest(
+                relationship_limit=relationship_limit
+            ), self.assertRaises(ValidationError):
+                self.service.get_vault_snapshot(
+                    context,
+                    relationship_limit=relationship_limit,  # type: ignore[arg-type]
+                )
+
+    def test_vault_snapshot_rejects_aggregate_ciphertext_over_cap(self) -> None:
+        vault_id, context = self.create_alice()
+        self.service.create_entity(context, "Synthetic", {"index": 1})
+        self.service.create_entity(context, "Synthetic", {"index": 2})
+        vault = self.repository.get_vault("idp|owner-alice", vault_id)
+        self.assertIsNotNone(vault)
+        assert vault is not None
+        encrypted = self.repository.get_vault_snapshot(
+            "idp|owner-alice",
+            vault_id,
+            vault.envelope.envelope_revision,
+            entity_limit=2,
+            relationship_limit=1,
+        )
+        self.assertIsNotNone(encrypted)
+        assert encrypted is not None
+        per_row_size = MAX_VAULT_SNAPSHOT_CIPHERTEXT_BYTES // 2 + 1
+        oversized = replace(
+            encrypted,
+            entities=tuple(
+                replace(
+                    row,
+                    payload=replace(
+                        row.payload,
+                        ciphertext=b"x" * per_row_size,
+                    ),
+                )
+                for row in encrypted.entities
+            ),
+        )
+
+        with patch.object(
+            self.repository,
+            "get_vault_snapshot",
+            return_value=oversized,
+        ), self.assertRaisesRegex(ValidationError, "complete vault"):
+            self.service.get_vault_snapshot(
+                context,
+                entity_limit=2,
+                relationship_limit=1,
+            )
+
+    def test_vault_snapshot_fails_closed_on_structural_row_corruption(
+        self,
+    ) -> None:
+        vault_id, context = self.create_alice()
+        first = self.service.create_entity(context, "Synthetic", {"index": 1})
+        second = self.service.create_entity(context, "Synthetic", {"index": 2})
+        self.service.connect(context, first, second, "LINKS")
+        vault = self.repository.get_vault("idp|owner-alice", vault_id)
+        self.assertIsNotNone(vault)
+        assert vault is not None
+        encrypted = self.repository.get_vault_snapshot(
+            "idp|owner-alice",
+            vault_id,
+            vault.envelope.envelope_revision,
+            entity_limit=10,
+            relationship_limit=10,
+        )
+        self.assertIsNotNone(encrypted)
+        assert encrypted is not None
+        self.assertEqual(len(encrypted.entities), 2)
+        self.assertEqual(len(encrypted.relationships), 1)
+
+        duplicate_entity_id = replace(
+            encrypted,
+            entities=encrypted.entities + (encrypted.entities[0],),
+        )
+        duplicate_relationship_id = replace(
+            encrypted,
+            relationships=(
+                encrypted.relationships + (encrypted.relationships[0],)
+            ),
+        )
+        missing_endpoint = replace(
+            encrypted,
+            relationships=(
+                replace(
+                    encrypted.relationships[0],
+                    to_entity_id="opaque-missing-endpoint",
+                ),
+            ),
+        )
+        cross_vault_entity = replace(
+            encrypted,
+            entities=(
+                replace(
+                    encrypted.entities[0],
+                    vault_id="opaque-other-vault",
+                ),
+                encrypted.entities[1],
+            ),
+        )
+        cross_vault_relationship = replace(
+            encrypted,
+            relationships=(
+                replace(
+                    encrypted.relationships[0],
+                    vault_id="opaque-other-vault",
+                ),
+            ),
+        )
+        corruptions = {
+            "duplicate entity ID": duplicate_entity_id,
+            "duplicate relationship ID": duplicate_relationship_id,
+            "missing relationship endpoint": missing_endpoint,
+            "cross-vault entity row": cross_vault_entity,
+            "cross-vault relationship row": cross_vault_relationship,
+        }
+
+        for description, corrupted in corruptions.items():
+            with self.subTest(description=description), patch.object(
+                self.repository,
+                "get_vault_snapshot",
+                return_value=corrupted,
+            ), self.assertRaises(IntegrityViolation):
+                self.service.get_vault_snapshot(context)
+
     def test_password_change_rewraps_key_and_revokes_old_sessions(self) -> None:
         vault_id, old_context = self.create_alice()
         before = self.repository.get_vault("idp|owner-alice", vault_id)
@@ -1248,6 +1523,7 @@ class AuthGraphSecurityTests(unittest.TestCase):
             "_PUT_RELATIONSHIP",
             "_GET_NEIGHBORS",
             "_GET_RELATIONSHIP",
+            "_GET_VAULT_SNAPSHOT",
         )
         for name in query_names:
             query = getattr(Neo4jGraphRepository, name)
@@ -1266,12 +1542,14 @@ class AuthGraphSecurityTests(unittest.TestCase):
             "_PUT_RELATIONSHIP",
             "_GET_NEIGHBORS",
             "_GET_RELATIONSHIP",
+            "_GET_VAULT_SNAPSHOT",
         ):
             self.assertIn("$envelope_revision", getattr(Neo4jGraphRepository, name))
         for name in (
             "_REPLACE_ENVELOPE",
             "_PUT_ENTITY",
             "_PUT_RELATIONSHIP",
+            "_GET_VAULT_SNAPSHOT",
         ):
             query = getattr(Neo4jGraphRepository, name)
             self.assertIn("SET vault._authgraph_lock = true", query)
@@ -1311,6 +1589,87 @@ class AuthGraphSecurityTests(unittest.TestCase):
         self.assertEqual(parameters["ciphertext"], b"ciphertext-and-tag")
         self.assertNotIn("kind", parameters)
         self.assertNotIn("properties", parameters)
+
+    def test_neo4j_adapter_decodes_snapshot_and_fetches_limit_plus_one(
+        self,
+    ) -> None:
+        driver = RecordingDriver(
+            [
+                {
+                    "entities": [
+                        {
+                            "entity_id": "opaque-entity",
+                            "payload_version": 1,
+                            "key_version": 2,
+                            "algorithm": "AES-256-GCM",
+                            "nonce": b"e" * 12,
+                            "ciphertext": b"entity-ciphertext-and-tag",
+                        }
+                    ],
+                    "relationships": [
+                        {
+                            "relationship_id": "opaque-link",
+                            "from_entity_id": "opaque-entity",
+                            "to_entity_id": "opaque-other-entity",
+                            "payload_version": 1,
+                            "key_version": 2,
+                            "algorithm": "AES-256-GCM",
+                            "nonce": b"r" * 12,
+                            "ciphertext": b"relationship-ciphertext-and-tag",
+                        }
+                    ],
+                }
+            ]
+        )
+        repository = Neo4jGraphRepository(driver, database="authgraph")
+
+        snapshot = repository.get_vault_snapshot(
+            "opaque-principal",
+            "opaque-vault",
+            7,
+            entity_limit=5,
+            relationship_limit=8,
+        )
+
+        self.assertIsNotNone(snapshot)
+        assert snapshot is not None
+        self.assertEqual(len(snapshot.entities), 1)
+        self.assertEqual(snapshot.entities[0].vault_id, "opaque-vault")
+        self.assertEqual(snapshot.entities[0].entity_id, "opaque-entity")
+        self.assertEqual(snapshot.entities[0].payload.key_version, 2)
+        self.assertEqual(
+            snapshot.entities[0].payload.ciphertext,
+            b"entity-ciphertext-and-tag",
+        )
+        self.assertEqual(len(snapshot.relationships), 1)
+        self.assertEqual(
+            snapshot.relationships[0].relationship_id,
+            "opaque-link",
+        )
+        self.assertEqual(
+            snapshot.relationships[0].from_entity_id,
+            "opaque-entity",
+        )
+        self.assertEqual(
+            snapshot.relationships[0].to_entity_id,
+            "opaque-other-entity",
+        )
+        self.assertEqual(
+            snapshot.relationships[0].payload.ciphertext,
+            b"relationship-ciphertext-and-tag",
+        )
+
+        self.assertEqual(len(driver.calls), 1)
+        query, kwargs = driver.calls[0]
+        self.assertEqual(query, Neo4jGraphRepository._GET_VAULT_SNAPSHOT)
+        self.assertEqual(kwargs["database_"], "authgraph")
+        parameters = kwargs["parameters_"]
+        self.assertIsInstance(parameters, dict)
+        self.assertEqual(parameters["principal_id"], "opaque-principal")
+        self.assertEqual(parameters["vault_id"], "opaque-vault")
+        self.assertEqual(parameters["envelope_revision"], 7)
+        self.assertEqual(parameters["entity_fetch_limit"], 6)
+        self.assertEqual(parameters["relationship_fetch_limit"], 9)
 
     def test_neo4j_adapter_rejects_unencrypted_driver(self) -> None:
         driver = RecordingDriver([])
@@ -1470,6 +1829,38 @@ class AuthGraphSecurityTests(unittest.TestCase):
         )
         with self.assertRaises(IntegrityViolation):
             repository.get_vault("opaque-principal", "opaque-vault")
+
+    def test_neo4j_adapter_rejects_malformed_snapshot_nested_lists(
+        self,
+    ) -> None:
+        malformed_snapshots = (
+            {
+                "entities": {"entity_id": "not-a-list"},
+                "relationships": [],
+            },
+            {
+                "entities": [None],
+                "relationships": [],
+            },
+            {
+                "entities": [],
+                "relationships": ["not-a-row"],
+            },
+        )
+        for malformed in malformed_snapshots:
+            with self.subTest(malformed=malformed):
+                repository = Neo4jGraphRepository(
+                    RecordingDriver([malformed]),
+                    database="authgraph",
+                )
+                with self.assertRaises(IntegrityViolation):
+                    repository.get_vault_snapshot(
+                        "opaque-principal",
+                        "opaque-vault",
+                        1,
+                        entity_limit=5,
+                        relationship_limit=5,
+                    )
 
 
 if __name__ == "__main__":

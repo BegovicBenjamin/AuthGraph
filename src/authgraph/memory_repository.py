@@ -11,6 +11,7 @@ from .models import (
     EncryptedNeighborhoodRow,
     EncryptedPayload,
     EncryptedRelationshipRow,
+    EncryptedVaultSnapshotRow,
     KeyEnvelope,
     VaultRow,
 )
@@ -177,6 +178,51 @@ class InMemoryGraphRepository:
                 center=center,
                 neighbors=neighbors,
                 relationships=tuple(relationships),
+            )
+
+    def get_vault_snapshot(
+        self,
+        principal_id: str,
+        vault_id: str,
+        envelope_revision: int,
+        *,
+        entity_limit: int,
+        relationship_limit: int,
+    ) -> EncryptedVaultSnapshotRow | None:
+        """Return bounded ciphertext rows plus one overflow sentinel row."""
+
+        if (
+            type(entity_limit) is not int
+            or entity_limit <= 0
+            or type(relationship_limit) is not int
+            or relationship_limit <= 0
+        ):
+            raise ValueError("Snapshot repository limits must be positive integers.")
+        with self._lock:
+            if (
+                self._owned_vault(
+                    principal_id,
+                    vault_id,
+                    envelope_revision,
+                )
+                is None
+            ):
+                return None
+            entities = tuple(
+                row
+                for (row_vault, _), row in sorted(self._entities.items())
+                if row_vault == vault_id
+            )[: entity_limit + 1]
+            relationships = tuple(
+                row
+                for (row_vault, _), row in sorted(
+                    self._relationships.items()
+                )
+                if row_vault == vault_id
+            )[: relationship_limit + 1]
+            return EncryptedVaultSnapshotRow(
+                entities=entities,
+                relationships=relationships,
             )
 
     def ciphertext_snapshot(self) -> dict[str, object]:

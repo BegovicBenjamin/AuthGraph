@@ -18,6 +18,7 @@ from .models import (
     EncryptedNeighborhoodRow,
     EncryptedPayload,
     EncryptedRelationshipRow,
+    EncryptedVaultSnapshotRow,
     KdfParameters,
     KeyEnvelope,
     VaultRow,
@@ -241,6 +242,57 @@ class Neo4jGraphRepository:
     LIMIT 1
     """
 
+    _GET_VAULT_SNAPSHOT = """
+    MATCH (vault:AGVault {
+        vault_id: $vault_id,
+        principal_id: $principal_id
+    })
+    SET vault._authgraph_lock = true
+    REMOVE vault._authgraph_lock
+    WITH vault
+    WHERE vault.envelope_revision = $envelope_revision
+    RETURN
+        COLLECT {
+            MATCH (vault)-[:AG_OWNS]->(entity:AGEntity {
+                vault_id: $vault_id
+            })
+            WITH entity
+            LIMIT $entity_fetch_limit
+            RETURN {
+                entity_id: entity.entity_id,
+                payload_version: entity.payload_version,
+                key_version: entity.key_version,
+                algorithm: entity.algorithm,
+                nonce: entity.nonce,
+                ciphertext: entity.ciphertext
+            } AS entity_row
+        } AS entities,
+        COLLECT {
+            MATCH (vault)-[:AG_OWNS]->(source:AGEntity {
+                vault_id: $vault_id
+            })-[link:AG_LINK {
+                vault_id: $vault_id
+            }]->(target:AGEntity {
+                vault_id: $vault_id
+            })
+            WHERE EXISTS {
+                MATCH (vault)-[:AG_OWNS]->(target)
+            }
+            WITH source, link, target
+            LIMIT $relationship_fetch_limit
+            RETURN {
+                relationship_id: link.relationship_id,
+                from_entity_id: source.entity_id,
+                to_entity_id: target.entity_id,
+                payload_version: link.payload_version,
+                key_version: link.key_version,
+                algorithm: link.algorithm,
+                nonce: link.nonce,
+                ciphertext: link.ciphertext
+            } AS relationship_row
+        } AS relationships
+    """
+
     def __init__(self, driver: Any, *, database: str) -> None:
         if not database:
             raise ValueError("An explicit Neo4j database name is required.")
@@ -296,6 +348,16 @@ class Neo4jGraphRepository:
         if not isinstance(value, (bytes, bytearray, memoryview)):
             raise IntegrityViolation()
         return bytes(value)
+
+    @staticmethod
+    def _record_list(record: Any, name: str) -> list[Any]:
+        try:
+            value = record[name]
+        except (KeyError, TypeError, IndexError):
+            raise IntegrityViolation() from None
+        if not isinstance(value, list):
+            raise IntegrityViolation()
+        return value
 
     @staticmethod
     def _envelope_parameters(envelope: KeyEnvelope) -> dict[str, object]:
@@ -624,4 +686,66 @@ class Neo4jGraphRepository:
             center=center,
             neighbors=tuple(neighbors.values()),
             relationships=tuple(relationships.values()),
+        )
+
+    def get_vault_snapshot(
+        self,
+        principal_id: str,
+        vault_id: str,
+        envelope_revision: int,
+        *,
+        entity_limit: int,
+        relationship_limit: int,
+    ) -> EncryptedVaultSnapshotRow | None:
+        """Fetch bounded ciphertext for one complete owner-vault snapshot."""
+
+        if (
+            type(entity_limit) is not int
+            or entity_limit <= 0
+            or type(relationship_limit) is not int
+            or relationship_limit <= 0
+        ):
+            raise ValueError("Snapshot repository limits must be positive integers.")
+        first = self._first(
+            self._execute(
+                self._GET_VAULT_SNAPSHOT,
+                principal_id=principal_id,
+                vault_id=vault_id,
+                envelope_revision=envelope_revision,
+                entity_fetch_limit=entity_limit + 1,
+                relationship_fetch_limit=relationship_limit + 1,
+            )
+        )
+        if first is None:
+            return None
+        entities = tuple(
+            EncryptedEntityRow(
+                vault_id=vault_id,
+                entity_id=self._record_text(record, "entity_id"),
+                payload=self._payload_from_record(record),
+            )
+            for record in self._record_list(first, "entities")
+        )
+        relationships = tuple(
+            EncryptedRelationshipRow(
+                vault_id=vault_id,
+                relationship_id=self._record_text(
+                    record,
+                    "relationship_id",
+                ),
+                from_entity_id=self._record_text(
+                    record,
+                    "from_entity_id",
+                ),
+                to_entity_id=self._record_text(
+                    record,
+                    "to_entity_id",
+                ),
+                payload=self._payload_from_record(record),
+            )
+            for record in self._record_list(first, "relationships")
+        )
+        return EncryptedVaultSnapshotRow(
+            entities=entities,
+            relationships=relationships,
         )

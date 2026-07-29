@@ -35,6 +35,9 @@ integrating application decides what those records mean.
   background sweeper removes expired resident keys by default.
 - Exposes only fixed, parameterized, principal- and vault-scoped repository
   operations. There is no arbitrary Cypher entry point.
+- Provides an explicit, bounded `get_vault_snapshot` operation for controlled
+  full-vault workflows. It returns the complete small vault or fails rather
+  than silently omitting records.
 - Uses generic Neo4j labels (`AGVault`, `AGEntity`) and a generic relationship
   type (`AG_LINK`) to reduce semantic metadata leakage.
 
@@ -45,8 +48,10 @@ The requested design needs one important correction:
 - The AI must **not** ask for a password in ordinary chat. A secure form or
   authentication screen must send it directly to the trusted key broker over
   TLS, outside chat history, model input, logs, analytics, and tracing.
-- The whole graph should never become "decrypted for the AI." The trusted
-  broker decrypts only an authorized, bounded result.
+- The whole graph should not routinely become "decrypted for the AI." Narrow,
+  task-specific retrieval is safer. This prototype nevertheless includes an
+  explicit full-vault snapshot operation for testing the requested workflow;
+  it is owner-scoped, bounded, and deliberately treated as high exposure.
 - If an LLM must reason over a protected fact, that LLM necessarily receives
   that fact as plaintext. Encryption cannot make a model both use and not see
   the same value. Keeping all sensitive plaintext away from an external model
@@ -71,7 +76,7 @@ Trusted key/session broker ---- short-lived in-memory vault DEK
         v
 Encrypted graph repository ---- Neo4j stores ciphertext + opaque IDs
         |
-        | minimum authorized result, decrypted transiently
+        | authorized bounded result, decrypted transiently
         v
 Future retrieval policy -------- optional LLM receives selected plaintext only
 ```
@@ -79,6 +84,33 @@ Future retrieval policy -------- optional LLM receives selected plaintext only
 The bearer session capability must be placed in a `Secure`, `HttpOnly`,
 appropriately `SameSite` cookie by a future web backend. It must not appear in
 an AI prompt or be accepted as an AI tool argument.
+
+## Full-vault snapshot mode
+
+`AuthGraphService.get_vault_snapshot()` is the explicit opt-in boundary for a
+small-vault chatbot experiment. The repository fetches ciphertext under the
+authenticated principal, vault, and envelope revision while serializing
+against cooperative Neo4j writes. The service authenticates and decrypts the
+result only while holding a guarded session-key lease.
+
+The default hard ceilings are 100 entities, 200 relationships, and 256 KiB of
+aggregate ciphertext. The operation probes one row past the requested count
+limits and fails if the complete vault does not fit; it never returns a
+silently truncated graph. AuthGraph does not cache the returned plaintext.
+The caller owns that plaintext object and must not write it to logs,
+transcripts, traces, caches, or durable model conversations.
+
+“Complete” means every well-formed row visible to the scoped query. AES-GCM
+does not prove that a hostile storage administrator did not delete a row or
+remove the metadata/ownership edge that makes it query-visible. Strong
+completeness needs an authenticated inventory or external transparency record,
+which this prototype does not implement.
+
+This mode does not make an external AI private: sending the snapshot to a
+hosted model reveals every included field to that provider. Python also cannot
+guarantee erasure of immutable strings after use. Use only synthetic data in
+the test harness, and prefer narrow retrieval or a suitably governed local
+model for real sensitive information.
 
 ## Storage model
 

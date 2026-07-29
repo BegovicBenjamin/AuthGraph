@@ -27,6 +27,7 @@ from .models import (
     Entity,
     Neighborhood,
     Relationship,
+    VaultSnapshot,
     VaultRow,
 )
 from .repository import GraphRepository
@@ -36,6 +37,9 @@ from .sessions import InMemorySessionBroker, SessionLease
 MAX_ID_CHARS = 256
 MAX_KIND_CHARS = 128
 MAX_NEIGHBORHOOD_SIZE = 100
+MAX_VAULT_SNAPSHOT_ENTITIES = 100
+MAX_VAULT_SNAPSHOT_RELATIONSHIPS = 200
+MAX_VAULT_SNAPSHOT_CIPHERTEXT_BYTES = 256 * 1024
 
 
 def _validate_opaque_id(value: str, description: str) -> None:
@@ -423,6 +427,115 @@ class AuthGraphService:
             return Neighborhood(
                 center=center,
                 neighbors=neighbors,
+                relationships=relationships,
+            )
+
+    def get_vault_snapshot(
+        self,
+        context: AccessContext,
+        *,
+        entity_limit: int = MAX_VAULT_SNAPSHOT_ENTITIES,
+        relationship_limit: int = MAX_VAULT_SNAPSHOT_RELATIONSHIPS,
+    ) -> VaultSnapshot:
+        """Decrypt one bounded, complete vault snapshot in trusted memory.
+
+        This deliberately high-exposure operation is intended for explicit
+        full-vault workflows. The caller owns the returned plaintext and must
+        not persist or log it.
+        """
+
+        if (
+            type(entity_limit) is not int
+            or entity_limit <= 0
+            or entity_limit > MAX_VAULT_SNAPSHOT_ENTITIES
+            or type(relationship_limit) is not int
+            or relationship_limit <= 0
+            or relationship_limit > MAX_VAULT_SNAPSHOT_RELATIONSHIPS
+        ):
+            raise ValidationError(
+                "Vault snapshot limits exceed the supported safety bounds."
+            )
+        with self._sessions.guarded_lease(context) as lease:
+            encrypted = self._repository.get_vault_snapshot(
+                lease.principal_id,
+                lease.vault_id,
+                lease.envelope_revision,
+                entity_limit=entity_limit,
+                relationship_limit=relationship_limit,
+            )
+            if encrypted is None:
+                raise RecordNotFound()
+            if (
+                len(encrypted.entities) > entity_limit
+                or len(encrypted.relationships) > relationship_limit
+            ):
+                raise ValidationError(
+                    "The complete vault does not fit within snapshot limits."
+                )
+            try:
+                ciphertext_bytes = sum(
+                    len(row.payload.ciphertext)
+                    for row in (
+                        *encrypted.entities,
+                        *encrypted.relationships,
+                    )
+                )
+                for row in encrypted.entities:
+                    _validate_opaque_object_id(row.entity_id)
+                for row in encrypted.relationships:
+                    _validate_opaque_object_id(row.relationship_id)
+                    _validate_opaque_object_id(row.from_entity_id)
+                    _validate_opaque_object_id(row.to_entity_id)
+            except (
+                AttributeError,
+                OverflowError,
+                TypeError,
+                ValidationError,
+            ):
+                raise IntegrityViolation() from None
+            if ciphertext_bytes > MAX_VAULT_SNAPSHOT_CIPHERTEXT_BYTES:
+                raise ValidationError(
+                    "The complete vault does not fit within snapshot limits."
+                )
+            entity_ids = {row.entity_id for row in encrypted.entities}
+            relationship_ids = {
+                row.relationship_id for row in encrypted.relationships
+            }
+            if (
+                len(entity_ids) != len(encrypted.entities)
+                or len(relationship_ids) != len(encrypted.relationships)
+                or any(
+                    row.vault_id != lease.vault_id
+                    or row.from_entity_id not in entity_ids
+                    or row.to_entity_id not in entity_ids
+                    for row in encrypted.relationships
+                )
+                or any(
+                    row.vault_id != lease.vault_id
+                    for row in encrypted.entities
+                )
+            ):
+                raise IntegrityViolation()
+            entities = tuple(
+                sorted(
+                    (
+                        self._decrypt_entity(lease, row)
+                        for row in encrypted.entities
+                    ),
+                    key=lambda entity: entity.entity_id,
+                )
+            )
+            relationships = tuple(
+                sorted(
+                    (
+                        self._decrypt_relationship(lease, row)
+                        for row in encrypted.relationships
+                    ),
+                    key=lambda relationship: relationship.relationship_id,
+                )
+            )
+            return VaultSnapshot(
+                entities=entities,
                 relationships=relationships,
             )
 

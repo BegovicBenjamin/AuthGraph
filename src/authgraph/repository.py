@@ -8,6 +8,7 @@ from .models import (
     EncryptedEntityRow,
     EncryptedNeighborhoodRow,
     EncryptedRelationshipRow,
+    EncryptedVaultSnapshotRow,
     KeyEnvelope,
     VaultRow,
 )
@@ -61,3 +62,16 @@ class GraphRepository(Protocol):
         *,
         limit: int,
     ) -> EncryptedNeighborhoodRow | None: ...
+
+    def get_vault_snapshot(
+        self,
+        principal_id: str,
+        vault_id: str,
+        envelope_revision: int,
+        *,
+        entity_limit: int,
+        relationship_limit: int,
+    ) -> EncryptedVaultSnapshotRow | None:
+        """Fetch at most each limit plus one row to detect truncation."""
+
+        ...
