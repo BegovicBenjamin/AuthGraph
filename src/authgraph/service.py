@@ -366,6 +366,158 @@ class AuthGraphService:
             "Could not allocate a unique opaque relationship identifier."
         )
 
+    def create_relationship_bundle(
+        self,
+        context: AccessContext,
+        new_entities: tuple[tuple[str, Mapping[str, Any]], ...],
+        from_endpoint: str | int,
+        to_endpoint: str | int,
+        kind: str,
+        properties: Mapping[str, Any] | None = None,
+    ) -> tuple[str, tuple[str, ...]]:
+        """Atomically create up to two helper entities and one relationship.
+
+        String endpoints refer to existing owner-vault entity IDs. Exact
+        integer endpoints refer to positions in ``new_entities``. This bounded
+        operation exists for layered-graph anchors so an interrupted write
+        cannot leave helper entities without their relationship.
+        """
+
+        if (
+            not isinstance(new_entities, tuple)
+            or not 1 <= len(new_entities) <= 2
+        ):
+            raise ValidationError(
+                "A relationship bundle requires one or two new entities."
+            )
+        copied_specs: list[tuple[str, dict[str, Any]]] = []
+        for spec in new_entities:
+            if not isinstance(spec, tuple) or len(spec) != 2:
+                raise ValidationError("Invalid relationship bundle entity.")
+            entity_kind, entity_properties = spec
+            _validate_kind(entity_kind)
+            copied_specs.append(
+                (entity_kind, _copy_properties(entity_properties))
+            )
+        _validate_kind(kind)
+        relationship_properties = (
+            {} if properties is None else _copy_properties(properties)
+        )
+
+        def validate_endpoint(endpoint: str | int) -> None:
+            if isinstance(endpoint, str):
+                _validate_opaque_object_id(endpoint)
+                return
+            if (
+                type(endpoint) is not int
+                or endpoint < 0
+                or endpoint >= len(copied_specs)
+            ):
+                raise ValidationError(
+                    "Invalid relationship bundle endpoint."
+                )
+
+        validate_endpoint(from_endpoint)
+        validate_endpoint(to_endpoint)
+        referenced_new_entities = {
+            endpoint
+            for endpoint in (from_endpoint, to_endpoint)
+            if type(endpoint) is int
+        }
+        if referenced_new_entities != set(range(len(copied_specs))):
+            raise ValidationError(
+                "Every new relationship bundle entity must be an endpoint."
+            )
+        existing_endpoint_ids = tuple(
+            endpoint
+            for endpoint in (from_endpoint, to_endpoint)
+            if isinstance(endpoint, str)
+        )
+
+        with self._sessions.guarded_lease(context) as lease:
+            for _ in range(3):
+                new_entity_ids = tuple(
+                    secrets.token_urlsafe(24) for _ in copied_specs
+                )
+
+                def resolve(endpoint: str | int) -> str:
+                    if isinstance(endpoint, str):
+                        return endpoint
+                    return new_entity_ids[endpoint]
+
+                from_entity_id = resolve(from_endpoint)
+                to_entity_id = resolve(to_endpoint)
+                entity_rows = tuple(
+                    EncryptedEntityRow(
+                        vault_id=lease.vault_id,
+                        entity_id=entity_id,
+                        payload=self._crypto.encrypt_json(
+                            lease.dek,
+                            {
+                                "kind": entity_kind,
+                                "properties": entity_properties,
+                            },
+                            aad_parts=_entity_aad(
+                                lease.vault_id,
+                                entity_id,
+                            ),
+                            key_version=lease.key_version,
+                        ),
+                    )
+                    for entity_id, (
+                        entity_kind,
+                        entity_properties,
+                    ) in zip(
+                        new_entity_ids,
+                        copied_specs,
+                        strict=True,
+                    )
+                )
+                relationship_id = secrets.token_urlsafe(24)
+                relationship_row = EncryptedRelationshipRow(
+                    vault_id=lease.vault_id,
+                    relationship_id=relationship_id,
+                    from_entity_id=from_entity_id,
+                    to_entity_id=to_entity_id,
+                    payload=self._crypto.encrypt_json(
+                        lease.dek,
+                        {
+                            "kind": kind,
+                            "properties": relationship_properties,
+                        },
+                        aad_parts=_relationship_aad(
+                            lease.vault_id,
+                            relationship_id,
+                            from_entity_id,
+                            to_entity_id,
+                        ),
+                        key_version=lease.key_version,
+                    ),
+                )
+                created = self._repository.put_entity_relationship_bundle(
+                    lease.principal_id,
+                    lease.vault_id,
+                    lease.envelope_revision,
+                    entity_rows,
+                    relationship_row,
+                )
+                if created:
+                    return relationship_id, new_entity_ids
+                if any(
+                    self._repository.get_entity(
+                        lease.principal_id,
+                        lease.vault_id,
+                        lease.envelope_revision,
+                        endpoint_id,
+                    )
+                    is None
+                    for endpoint_id in existing_endpoint_ids
+                ):
+                    raise RecordNotFound()
+        raise ConflictError(
+            "Could not allocate a unique encrypted relationship bundle."
+        )
+
     def get_neighborhood(
         self,
         context: AccessContext,

@@ -26,8 +26,9 @@ integrating application decides what those records mean.
 - Authenticates a monotonically increasing envelope revision and replaces
   passphrase envelopes with compare-and-swap, fencing stale concurrent unlocks
   in the single-process broker.
-- Encrypts entity types, relationship types, and their properties with
-  AES-256-GCM before they reach Neo4j.
+- Encrypts `PRIVATE` entity types, relationship types, and their properties
+  with AES-256-GCM before they reach Neo4j. `PUBLIC` layered records are an
+  explicit plaintext exception described below.
 - Binds every ciphertext to its vault and object IDs with authenticated
   associated data, so copied or altered ciphertext fails closed.
 - Keeps an unlocked DEK only in a short-lived in-memory session. Every
@@ -38,6 +39,11 @@ integrating application decides what those records mean.
 - Provides an explicit, bounded `get_vault_snapshot` operation for controlled
   full-vault workflows. It returns the complete small vault or fails rather
   than silently omitting records.
+- Provides an additive layered-graph API in which each new entity and
+  relationship inherits a configurable `PUBLIC` or `PRIVATE` default and may,
+  when policy permits, override that choice per record.
+- Returns only the public base graph while locked. An unlocked view composes
+  that base with exactly one owner-scoped encrypted overlay.
 - Uses generic Neo4j labels (`AGVault`, `AGEntity`) and a generic relationship
   type (`AG_LINK`) to reduce semantic metadata leakage.
 
@@ -85,6 +91,83 @@ The bearer session capability must be placed in a `Secure`, `HttpOnly`,
 appropriately `SameSite` cookie by a future web backend. It must not appear in
 an AI prompt or be accepted as an AI tool argument.
 
+## Dynamic public and private records
+
+`LayeredGraphService` adds the mixed model without weakening the original
+encrypted-vault API:
+
+```text
+Public base graph                Owner overlay
+----------------------------     ----------------------------------
+AGPublicEntity                   AGEntity
+AG_PUBLIC_LINK                   AG_LINK
+plaintext kind + properties      encrypted kind + properties
+available while locked           requires the owner's live session
+```
+
+`GraphPolicy` controls the defaults independently for entities and
+relationships. Both defaults are `ProtectionLevel.PRIVATE`. When
+`allow_public_overrides` is enabled, a trusted application can explicitly
+choose `ProtectionLevel.PUBLIC` or `ProtectionLevel.PRIVATE` for each new
+record. Tightening a public default to private is always permitted. Different
+named graphs can receive different policies.
+
+This is the important meaning of `PUBLIC`: the semantic kind and properties
+are plaintext at AuthGraph's application-encryption layer. They are still
+protected operationally by Neo4j authentication, authorization, TLS, disk
+encryption, and backup controls, but a database reader can see them. Never mark
+personal or confidential data public merely to avoid asking for an unlock.
+
+While locked, `get_public_view()` does not fetch, decrypt, count, or return any
+private record. Policy may optionally return
+`LockedDisclosure.GENERIC_BADGE`; that value is identical for an empty and
+populated overlay, so it is not a private-record existence oracle. Per-record
+placeholders are deliberately not supported because they leak private counts
+and graph shape. `get_unlocked_view()` is the separate high-exposure operation
+that requires a live owner context and composes the encrypted overlay.
+Public snapshots also fail rather than truncate above 100 entities, 200
+relationships, or 256 KiB of aggregate semantic JSON by default.
+
+An encrypted relationship may join private entities and/or public entities.
+For a public endpoint, AuthGraph creates an opaque encrypted anchor inside the
+owner's vault. The public ID and the relationship meaning remain inside
+ciphertext and are resolved only in trusted memory after unlock. A public
+relationship is allowed only when both endpoints are public. Consequently, a
+locked view never contains a dangling edge to a hidden node.
+
+One unlocked view accepts one `AccessContext`, so Benjamin's session composes
+only Benjamin's overlay; it cannot retrieve Alexa's overlay. The trusted
+identity path is `authenticated person -> authorized opaque vault ID -> unlock
+-> AccessContext -> get_unlocked_view()`. That mapping belongs in an identity
+or control-plane store, not in public Neo4j properties. A person's name is a
+claim or display value, not proof of identity.
+
+The current layered API classifies records when they are created. It does not
+yet reclassify an existing record. Publishing previously private data is an
+irreversible disclosure to clients, logs, transaction history, and backups;
+privatizing previously public data cannot recall those copies. A future
+reclassification workflow therefore needs an explicit authenticated,
+auditable, atomic migration rather than a mutable `encrypted=false` flag.
+
+Public mutation methods require both an explicit policy opt-in and an
+application-supplied publisher context accepted by
+`public_write_authorizer`. Public means readable without the owner's vault
+password, not writable by anyone. `graph_id` is a scope, not authorization and
+not a secret. Do not expose publisher contexts or generic create/connect
+operations to a chatbot. The integrating application must authorize
+administrators and data owners before invoking them.
+
+Policies are startup configuration in this prototype: they are not yet
+persisted, revisioned, or audited, and changing a policy affects only future
+writes and the generic badge. The unlocked composer currently decrypts one
+bounded whole-vault snapshot before filtering its layered wrappers. Prefer one
+layered graph per vault for this test version. Each encrypted connection to a
+public endpoint also creates an encrypted helper anchor. AuthGraph creates the
+new anchors and their relationship in one atomic repository operation, so a
+failed write leaves neither. Successful connections can still create duplicate
+anchors, and anchors count toward the private snapshot limit. Production needs
+a deduplicated external-reference design.
+
 ## Full-vault snapshot mode
 
 `AuthGraphService.get_vault_snapshot()` is the explicit opt-in boundary for a
@@ -116,12 +199,17 @@ model for real sensitive information.
 
 ```text
 (AGVault)-[:AG_OWNS]->(AGEntity)-[:AG_LINK]->(AGEntity)
+
+(AGPublicGraph)-[:AG_PUBLIC_OWNS]->(AGPublicEntity)
+     (AGPublicEntity)-[:AG_PUBLIC_LINK]->(AGPublicEntity)
 ```
 
 The meaningful entity kind, relationship kind, and all semantic properties are
-inside authenticated ciphertext. The plaintext `principal_id` must be an
-opaque identity-provider subject—not a name, email address, government
-identifier, customer number, account number, or other PII.
+inside authenticated ciphertext for `AGEntity` and `AG_LINK`. Records under
+`AGPublicEntity` and `AG_PUBLIC_LINK` are intentionally plaintext. The
+plaintext `principal_id`, `vault_id`, and public `graph_id` must be opaque
+application identifiers—not a name, email address, government identifier,
+customer number, account number, or other PII.
 
 Apply [neo4j/schema.cypher](neo4j/schema.cypher) before using the Neo4j
 repository. The Python driver must use encrypted transport (`neo4j+s` for Aura)
@@ -167,8 +255,9 @@ component, not an authoritative system of record.
 
 The Neo4j adapter and Cypher have been reviewed statically but have not been
 run against a live Neo4j instance in this workspace. The unit tests use a
-ciphertext-only in-memory repository and a recording driver; a real two-vault
-integration suite is still required.
+ciphertext-only private repository, a separate intentionally plaintext public
+repository, and recording drivers; a real two-vault layered integration suite
+is still required.
 
 Before real sensitive data is used, at minimum add:
 

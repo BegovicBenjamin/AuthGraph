@@ -137,6 +137,51 @@ class InMemoryGraphRepository:
             self._relationships[key] = row
             return True
 
+    def put_entity_relationship_bundle(
+        self,
+        principal_id: str,
+        vault_id: str,
+        envelope_revision: int,
+        entity_rows: tuple[EncryptedEntityRow, ...],
+        relationship_row: EncryptedRelationshipRow,
+    ) -> bool:
+        """Atomically create helper entities and their encrypted edge."""
+
+        with self._lock:
+            entity_keys = tuple(
+                (vault_id, row.entity_id) for row in entity_rows
+            )
+            relationship_key = (
+                vault_id,
+                relationship_row.relationship_id,
+            )
+            available_entity_ids = {
+                entity_id
+                for row_vault, entity_id in self._entities
+                if row_vault == vault_id
+            } | {row.entity_id for row in entity_rows}
+            if (
+                self._owned_vault(
+                    principal_id,
+                    vault_id,
+                    envelope_revision,
+                )
+                is None
+                or not entity_rows
+                or len(entity_keys) != len(set(entity_keys))
+                or any(row.vault_id != vault_id for row in entity_rows)
+                or any(key in self._entities for key in entity_keys)
+                or relationship_row.vault_id != vault_id
+                or relationship_key in self._relationships
+                or relationship_row.from_entity_id not in available_entity_ids
+                or relationship_row.to_entity_id not in available_entity_ids
+            ):
+                return False
+            for key, row in zip(entity_keys, entity_rows, strict=True):
+                self._entities[key] = row
+            self._relationships[relationship_key] = relationship_row
+            return True
+
     def get_neighborhood(
         self,
         principal_id: str,

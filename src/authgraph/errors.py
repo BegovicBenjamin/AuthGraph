@@ -31,6 +31,13 @@ class SessionUnavailable(AuthGraphError):
         super().__init__("The secure session is unavailable.")
 
 
+class AuthorizationDenied(AuthGraphError):
+    """The authenticated application context may not perform an operation."""
+
+    def __init__(self) -> None:
+        super().__init__("The operation is not authorized.")
+
+
 class RecordNotFound(AuthGraphError):
     """A record is absent or outside the caller's authorized vault."""
 

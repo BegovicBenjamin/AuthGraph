@@ -10,8 +10,10 @@ compliance.
 
 ## Security goals
 
-1. A stolen Neo4j data store or backup does not reveal encrypted semantic
-   entity types, relationship types, or properties without a vault secret.
+1. A stolen Neo4j data store or backup does not reveal semantic entity types,
+   relationship types, or properties for records classified `PRIVATE` without
+   a vault secret. Records explicitly classified `PUBLIC` are intentionally
+   plaintext at AuthGraph's application-encryption layer.
 2. A principal can retrieve records only from the vault bound to that
    principal's secure session.
 3. A passphrase, KEK, DEK, Neo4j credential, or session token never enters an
@@ -29,6 +31,7 @@ Application encryption is not magic searchable encryption.
 
 Neo4j can see:
 
+- every semantic kind and property deliberately stored in the public layer;
 - opaque principal, vault, entity, and relationship identifiers;
 - that entities belong to the same vault;
 - generic connectivity, direction, graph size, and access patterns;
@@ -45,6 +48,12 @@ A compromised trusted broker can capture active DEKs and plaintext. Encryption
 cannot protect data from the component that is currently authorized to decrypt
 it. Production must minimize, isolate, patch, monitor, and egress-restrict that
 trusted computing base.
+
+The layered API's term `PUBLIC` does not mean anonymously writable and does not
+replace database security. It means that anyone who can read the applicable
+Neo4j records or backups can read those semantics without the owner's
+passphrase. TLS, Neo4j RBAC, disk encryption, private networking, and backup
+controls remain required.
 
 AES-GCM authenticates a record that is present; it does not prove completeness
 or freshness. An attacker able to delete rows can cause unavailable or partial
@@ -108,6 +117,79 @@ revocation may also require rotating the vault DEK.
 The identity-provider subject-to-owner mapping should remain outside Neo4j.
 Do not use names, emails, government identifiers, customer/account numbers, or
 other PII as `principal_id` or `vault_id`.
+
+## Layered public graph and private overlays
+
+`LayeredGraphService` keeps the existing encrypted storage path unchanged and
+adds a physically separate public path:
+
+```text
+Public:   AGPublicGraph / AGPublicEntity / AG_PUBLIC_LINK
+Private:  AGVault / AGEntity / AG_LINK
+```
+
+The secure defaults classify every new entity and relationship as `PRIVATE`.
+A `GraphPolicy` may select different defaults for a named graph.
+`allow_public_overrides` must be explicitly enabled before one record can
+weaken a private default to plaintext public. Tightening a public default to
+private is always permitted. Unknown or malformed policy values fail rather
+than falling back to public.
+
+`get_public_view()` queries only the public repository. It does not enumerate
+or decrypt the private repository and does not return private identifiers,
+types, counts, per-record placeholders, or bridge topology. `GENERIC_BADGE`,
+when configured, is one fixed policy result returned for both an empty and
+populated overlay. It therefore says what the application supports, not
+whether a private record exists. `get_unlocked_view()` is a separate explicit
+operation requiring a live vault context. Public snapshots fail rather than
+truncate when their fixed entity, relationship, or aggregate semantic-byte
+limits are exceeded.
+
+A public relationship is valid only between two public endpoints. A private
+relationship may refer to a public endpoint through an encrypted anchor entity
+inside the owner's vault. The anchor's public ID and the relationship semantics
+are encrypted; Neo4j sees only opaque private IDs and generic private topology.
+After unlock, the trusted service resolves anchors and rejects missing,
+duplicate, cross-graph, or dangling endpoints before returning a composed view.
+
+One composed read uses exactly one live owner `AccessContext`. It returns the
+public base plus that context's vault overlay; it does not scan or combine other
+owners' vaults. Authentication and the principal-to-vault lookup are external
+identity functions kept outside the public graph. The flow is `authenticated
+person -> authorized opaque vault ID -> unlock -> AccessContext ->
+get_unlocked_view()`. A name in chat must never select the authorization scope.
+
+The public repository accepts trusted backend writes without a vault password
+because common application knowledge may not belong to one person. This is not
+end-user authorization. `LayeredGraphService` additionally requires an
+application publisher context accepted by `public_write_authorizer`; `graph_id`
+is scope, not authorization or a secret. A web adapter must enforce its own
+administrator/data-owner policy and must not expose publisher contexts or
+public/private generic writes as AI tools.
+
+Classification is immutable in the current layered prototype. An existing
+private record cannot be exposed merely by changing metadata, and missing or
+malformed encryption fields are never interpreted as public. A future
+private-to-public operation must decrypt and copy in one authenticated,
+auditable, atomic transaction with explicit confirmation. Publication may
+leave plaintext in clients, logs, transaction history, caches, and backups.
+A future public-to-private operation protects only future access and cannot
+recall those copies.
+
+The layered composer uses a bounded full-vault snapshot because the requested
+test behavior gives the chatbot all of one owner's data after unlock. That
+snapshot is decrypted before layered records are filtered by `graph_id`, so
+unrelated records enter trusted transient memory and count toward the limits.
+Prefer one layered graph per vault in this prototype. Production retrieval
+should ordinarily remain task-specific and return fewer fields.
+
+Policies are in-process startup configuration, not persisted or revisioned
+security records. Changing them affects future writes and the badge only. Each
+private edge involving a public endpoint currently creates an encrypted helper
+anchor. New anchors and their relationship are committed atomically, so a
+failed write leaves neither. Successful connections can still create duplicate
+anchors, and anchors count toward the snapshot limit. Production needs a
+deduplicated external-reference design.
 
 ## Unlock and session flow
 
@@ -174,6 +256,13 @@ The service verifies both edge endpoints inside the same vault. It intentionally
 uses generic `AGEntity` and `AG_LINK` semantics so a database reader cannot see
 plaintext labels such as `PrivateCategory`, `SensitiveEvent`, or `RELATED_TO`.
 
+The separate public adapter likewise exposes only fixed, graph-scoped query
+templates. It stores properties as canonical plaintext JSON and never queries
+private labels. Public graph IDs and public object IDs are opaque, bounded
+values supplied as parameters rather than interpolated into Cypher. Cooperative
+public writes and bounded snapshots take the same transient public-graph lock
+so a snapshot cannot pair a new relationship with an older entity collection.
+
 The adapter treats an exact row already present after a zero-row write or
 `IncompleteCommit` as a successful retry. If it cannot verify the exact row,
 the ambiguous error is propagated rather than silently generating another ID.
@@ -185,6 +274,9 @@ Protected writes take an explicit temporary-property lock on the vault before
 reading its envelope revision. This is required because Neo4j's default
 read-committed isolation does not by itself make a revision predicate a
 compare-and-swap. The temporary property is removed in the same transaction.
+Layered public anchors and their encrypted relationship are created by one
+fixed query in that same vault-locked transaction, so the bundle commits as a
+whole or leaves no helper records.
 The full-vault snapshot query takes the same lock before checking the revision,
 so cooperative writes cannot produce a torn snapshot. The lock has no durable
 semantic effect, but it is held for the transaction.
@@ -255,8 +347,16 @@ The included unit tests cover the first layer:
 - invalid/non-finite TTL rejection and strict storage-metadata decoding;
 - in-flight lifecycle serialization, concurrent shutdown/key-zeroization
   ordering, fail-closed sweeper failure, and stale-replica repository
-  fencing; and
-- fixed, vault-scoped Neo4j query templates.
+  fencing;
+- fixed, vault-scoped Neo4j query templates;
+- per-record public/private choices with private-by-default policies;
+- locked public-only views that do not invoke private decryption;
+- public/private endpoint and relationship visibility invariants;
+- encrypted anchors for public-to-private and private public-to-public edges;
+- atomic failure behavior for encrypted anchor/relationship bundles;
+- two-owner overlay isolation over one shared public graph;
+- policy-driven generic badges that reveal no private record count; and
+- fixed, graph-scoped public Neo4j query templates and malformed-row rejection.
 
 Production also needs:
 

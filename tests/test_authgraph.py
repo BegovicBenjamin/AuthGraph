@@ -687,6 +687,25 @@ class AuthGraphSecurityTests(unittest.TestCase):
         self.assertNotIn("REFERENCES", stored)
         self.assertNotIn("synthetic-item", stored)
 
+    def test_relationship_bundle_rejects_unused_helper_without_writing(
+        self,
+    ) -> None:
+        _, context = self.create_alice()
+        with self.assertRaises(ValidationError):
+            self.service.create_relationship_bundle(
+                context,
+                (
+                    ("Helper", {"position": 0}),
+                    ("Unused", {"position": 1}),
+                ),
+                0,
+                0,
+                "LINK",
+            )
+        snapshot = self.service.get_vault_snapshot(context)
+        self.assertEqual(snapshot.entities, ())
+        self.assertEqual(snapshot.relationships, ())
+
     def test_vault_snapshot_returns_complete_graph_including_isolated_entity(
         self,
     ) -> None:
@@ -1521,6 +1540,7 @@ class AuthGraphSecurityTests(unittest.TestCase):
             "_PUT_ENTITY",
             "_GET_ENTITY",
             "_PUT_RELATIONSHIP",
+            "_PUT_ENTITY_RELATIONSHIP_BUNDLE",
             "_GET_NEIGHBORS",
             "_GET_RELATIONSHIP",
             "_GET_VAULT_SNAPSHOT",
@@ -1532,6 +1552,14 @@ class AuthGraphSecurityTests(unittest.TestCase):
         self.assertNotIn("$kind", Neo4jGraphRepository._PUT_ENTITY)
         self.assertNotIn("$properties", Neo4jGraphRepository._PUT_ENTITY)
         self.assertNotIn("$kind", Neo4jGraphRepository._PUT_RELATIONSHIP)
+        self.assertNotIn(
+            "$kind",
+            Neo4jGraphRepository._PUT_ENTITY_RELATIONSHIP_BUNDLE,
+        )
+        self.assertNotIn(
+            "$properties",
+            Neo4jGraphRepository._PUT_ENTITY_RELATIONSHIP_BUNDLE,
+        )
         self.assertIn(
             "vault.envelope_revision = $expected_revision",
             Neo4jGraphRepository._REPLACE_ENVELOPE,
@@ -1540,6 +1568,7 @@ class AuthGraphSecurityTests(unittest.TestCase):
             "_PUT_ENTITY",
             "_GET_ENTITY",
             "_PUT_RELATIONSHIP",
+            "_PUT_ENTITY_RELATIONSHIP_BUNDLE",
             "_GET_NEIGHBORS",
             "_GET_RELATIONSHIP",
             "_GET_VAULT_SNAPSHOT",
@@ -1549,6 +1578,7 @@ class AuthGraphSecurityTests(unittest.TestCase):
             "_REPLACE_ENVELOPE",
             "_PUT_ENTITY",
             "_PUT_RELATIONSHIP",
+            "_PUT_ENTITY_RELATIONSHIP_BUNDLE",
             "_GET_VAULT_SNAPSHOT",
         ):
             query = getattr(Neo4jGraphRepository, name)
@@ -1589,6 +1619,142 @@ class AuthGraphSecurityTests(unittest.TestCase):
         self.assertEqual(parameters["ciphertext"], b"ciphertext-and-tag")
         self.assertNotIn("kind", parameters)
         self.assertNotIn("properties", parameters)
+
+    def test_neo4j_adapter_sends_atomic_bundle_as_ciphertext_only(self) -> None:
+        driver = RecordingDriver(
+            [{"created_entities": 2, "created_relationships": 1}]
+        )
+        repository = Neo4jGraphRepository(driver, database="authgraph")
+        first = EncryptedEntityRow(
+            vault_id="opaque-vault",
+            entity_id="helper-one",
+            payload=EncryptedPayload(
+                version=1,
+                key_version=1,
+                algorithm="AES-256-GCM",
+                nonce=b"a" * 12,
+                ciphertext=b"first-ciphertext-and-tag",
+            ),
+        )
+        second = EncryptedEntityRow(
+            vault_id="opaque-vault",
+            entity_id="helper-two",
+            payload=EncryptedPayload(
+                version=1,
+                key_version=1,
+                algorithm="AES-256-GCM",
+                nonce=b"b" * 12,
+                ciphertext=b"second-ciphertext-and-tag",
+            ),
+        )
+        relationship = EncryptedRelationshipRow(
+            vault_id="opaque-vault",
+            relationship_id="opaque-link",
+            from_entity_id=first.entity_id,
+            to_entity_id=second.entity_id,
+            payload=EncryptedPayload(
+                version=1,
+                key_version=1,
+                algorithm="AES-256-GCM",
+                nonce=b"c" * 12,
+                ciphertext=b"link-ciphertext-and-tag",
+            ),
+        )
+
+        self.assertTrue(
+            repository.put_entity_relationship_bundle(
+                "opaque-principal",
+                "opaque-vault",
+                1,
+                (first, second),
+                relationship,
+            )
+        )
+        query, kwargs = driver.calls[0]
+        self.assertEqual(
+            query,
+            Neo4jGraphRepository._PUT_ENTITY_RELATIONSHIP_BUNDLE,
+        )
+        parameters = kwargs["parameters_"]
+        self.assertEqual(kwargs["database_"], "authgraph")
+        self.assertEqual(
+            [row["ciphertext"] for row in parameters["entity_rows"]],
+            [
+                b"first-ciphertext-and-tag",
+                b"second-ciphertext-and-tag",
+            ],
+        )
+        self.assertEqual(
+            parameters["relationship_ciphertext"],
+            b"link-ciphertext-and-tag",
+        )
+        self.assertNotIn("kind", repr(parameters))
+        self.assertNotIn("properties", repr(parameters))
+
+    def test_neo4j_atomic_bundle_reconciles_incomplete_commit_exactly(
+        self,
+    ) -> None:
+        entity_payload = EncryptedPayload(
+            version=1,
+            key_version=1,
+            algorithm="AES-256-GCM",
+            nonce=b"a" * 12,
+            ciphertext=b"entity-ciphertext-and-tag",
+        )
+        relationship_payload = EncryptedPayload(
+            version=1,
+            key_version=1,
+            algorithm="AES-256-GCM",
+            nonce=b"b" * 12,
+            ciphertext=b"relationship-ciphertext-and-tag",
+        )
+        entity = EncryptedEntityRow(
+            vault_id="opaque-vault",
+            entity_id="helper-one",
+            payload=entity_payload,
+        )
+        relationship = EncryptedRelationshipRow(
+            vault_id="opaque-vault",
+            relationship_id="opaque-link",
+            from_entity_id=entity.entity_id,
+            to_entity_id=entity.entity_id,
+            payload=relationship_payload,
+        )
+        driver = SequencedRecordingDriver(
+            [
+                IncompleteCommit(),
+                [
+                    {
+                        "payload_version": entity_payload.version,
+                        "key_version": entity_payload.key_version,
+                        "algorithm": entity_payload.algorithm,
+                        "nonce": entity_payload.nonce,
+                        "ciphertext": entity_payload.ciphertext,
+                    }
+                ],
+                [
+                    {
+                        "payload_version": relationship_payload.version,
+                        "key_version": relationship_payload.key_version,
+                        "algorithm": relationship_payload.algorithm,
+                        "nonce": relationship_payload.nonce,
+                        "ciphertext": relationship_payload.ciphertext,
+                    }
+                ],
+            ]
+        )
+        repository = Neo4jGraphRepository(driver, database="authgraph")
+
+        self.assertTrue(
+            repository.put_entity_relationship_bundle(
+                "opaque-principal",
+                "opaque-vault",
+                1,
+                (entity,),
+                relationship,
+            )
+        )
+        self.assertEqual(len(driver.calls), 3)
 
     def test_neo4j_adapter_decodes_snapshot_and_fetches_limit_plus_one(
         self,

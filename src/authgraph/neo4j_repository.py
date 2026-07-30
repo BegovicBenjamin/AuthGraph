@@ -181,6 +181,81 @@ class Neo4jGraphRepository:
     RETURN count(link) AS created
     """
 
+    _PUT_ENTITY_RELATIONSHIP_BUNDLE = """
+    MATCH (vault:AGVault {
+        vault_id: $vault_id,
+        principal_id: $principal_id
+    })
+    SET vault._authgraph_lock = true
+    REMOVE vault._authgraph_lock
+    WITH vault
+    WHERE
+        vault.envelope_revision = $envelope_revision
+        AND all(candidate IN $entity_rows WHERE NOT EXISTS {
+            MATCH (:AGEntity {entity_id: candidate.entity_id})
+        })
+        AND NOT EXISTS {
+            MATCH ()-[existing:AG_LINK {
+                relationship_id: $relationship_id
+            }]->()
+        }
+        AND (
+            $from_entity_id IN [
+                candidate IN $entity_rows | candidate.entity_id
+            ]
+            OR EXISTS {
+                MATCH (vault)-[:AG_OWNS]->(:AGEntity {
+                    vault_id: $vault_id,
+                    entity_id: $from_entity_id
+                })
+            }
+        )
+        AND (
+            $to_entity_id IN [
+                candidate IN $entity_rows | candidate.entity_id
+            ]
+            OR EXISTS {
+                MATCH (vault)-[:AG_OWNS]->(:AGEntity {
+                    vault_id: $vault_id,
+                    entity_id: $to_entity_id
+                })
+            }
+        )
+    FOREACH (candidate IN $entity_rows |
+        CREATE (entity:AGEntity {
+            vault_id: $vault_id,
+            entity_id: candidate.entity_id,
+            payload_version: candidate.payload_version,
+            key_version: candidate.key_version,
+            algorithm: candidate.algorithm,
+            nonce: candidate.nonce,
+            ciphertext: candidate.ciphertext
+        })
+        CREATE (vault)-[:AG_OWNS]->(entity)
+    )
+    WITH vault
+    MATCH (vault)-[:AG_OWNS]->(source:AGEntity {
+        vault_id: $vault_id,
+        entity_id: $from_entity_id
+    })
+    MATCH (vault)-[:AG_OWNS]->(target:AGEntity {
+        vault_id: $vault_id,
+        entity_id: $to_entity_id
+    })
+    CREATE (source)-[link:AG_LINK {
+        vault_id: $vault_id,
+        relationship_id: $relationship_id,
+        payload_version: $relationship_payload_version,
+        key_version: $relationship_key_version,
+        algorithm: $relationship_algorithm,
+        nonce: $relationship_nonce,
+        ciphertext: $relationship_ciphertext
+    }]->(target)
+    RETURN
+        size($entity_rows) AS created_entities,
+        count(link) AS created_relationships
+    """
+
     _GET_NEIGHBORS = """
     MATCH (vault:AGVault {
         vault_id: $vault_id,
@@ -609,6 +684,105 @@ class Neo4jGraphRepository:
             row.to_entity_id,
         )
         return existing == row
+
+    def put_entity_relationship_bundle(
+        self,
+        principal_id: str,
+        vault_id: str,
+        envelope_revision: int,
+        entity_rows: tuple[EncryptedEntityRow, ...],
+        relationship_row: EncryptedRelationshipRow,
+    ) -> bool:
+        if (
+            not 1 <= len(entity_rows) <= 2
+            or any(row.vault_id != vault_id for row in entity_rows)
+            or len({row.entity_id for row in entity_rows}) != len(entity_rows)
+            or relationship_row.vault_id != vault_id
+        ):
+            return False
+        entity_parameters = [
+            {
+                "entity_id": row.entity_id,
+                **self._payload_parameters(row.payload),
+            }
+            for row in entity_rows
+        ]
+        relationship_payload = self._payload_parameters(
+            relationship_row.payload
+        )
+        parameters = {
+            "principal_id": principal_id,
+            "vault_id": vault_id,
+            "envelope_revision": envelope_revision,
+            "entity_rows": entity_parameters,
+            "relationship_id": relationship_row.relationship_id,
+            "from_entity_id": relationship_row.from_entity_id,
+            "to_entity_id": relationship_row.to_entity_id,
+            "relationship_payload_version": relationship_payload[
+                "payload_version"
+            ],
+            "relationship_key_version": relationship_payload["key_version"],
+            "relationship_algorithm": relationship_payload["algorithm"],
+            "relationship_nonce": relationship_payload["nonce"],
+            "relationship_ciphertext": relationship_payload["ciphertext"],
+        }
+        try:
+            first = self._first(
+                self._execute(
+                    self._PUT_ENTITY_RELATIONSHIP_BUNDLE,
+                    **parameters,
+                )
+            )
+        except IncompleteCommit:
+            if self._entity_relationship_bundle_is_exact(
+                principal_id,
+                vault_id,
+                envelope_revision,
+                entity_rows,
+                relationship_row,
+            ):
+                return True
+            raise
+        if (
+            first is not None
+            and self._record_integer(first, "created_entities")
+            == len(entity_rows)
+            and self._record_integer(first, "created_relationships") == 1
+        ):
+            return True
+        return self._entity_relationship_bundle_is_exact(
+            principal_id,
+            vault_id,
+            envelope_revision,
+            entity_rows,
+            relationship_row,
+        )
+
+    def _entity_relationship_bundle_is_exact(
+        self,
+        principal_id: str,
+        vault_id: str,
+        envelope_revision: int,
+        entity_rows: tuple[EncryptedEntityRow, ...],
+        relationship_row: EncryptedRelationshipRow,
+    ) -> bool:
+        return all(
+            self.get_entity(
+                principal_id,
+                vault_id,
+                envelope_revision,
+                row.entity_id,
+            )
+            == row
+            for row in entity_rows
+        ) and self._get_relationship(
+            principal_id,
+            vault_id,
+            envelope_revision,
+            relationship_row.relationship_id,
+            relationship_row.from_entity_id,
+            relationship_row.to_entity_id,
+        ) == relationship_row
 
     def _get_relationship(
         self,

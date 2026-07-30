@@ -53,6 +53,18 @@ class GraphRepository(Protocol):
         row: EncryptedRelationshipRow,
     ) -> bool: ...
 
+    def put_entity_relationship_bundle(
+        self,
+        principal_id: str,
+        vault_id: str,
+        envelope_revision: int,
+        entity_rows: tuple[EncryptedEntityRow, ...],
+        relationship_row: EncryptedRelationshipRow,
+    ) -> bool:
+        """Atomically create helper entities and one relationship."""
+
+        ...
+
     def get_neighborhood(
         self,
         principal_id: str,
