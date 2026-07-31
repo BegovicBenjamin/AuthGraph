@@ -110,4 +110,8 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 Technical security details are in
 [docs/SECURITY_MODEL.md](docs/SECURITY_MODEL.md).
 
+The complete current API guide is in [docs/USAGE.md](docs/USAGE.md).
+The planned chatbot, scoped-unlock, one-time-code, and GraphRAG design is in
+[docs/CHATBOT_GRAPHRAG_DESIGN.md](docs/CHATBOT_GRAPHRAG_DESIGN.md).
+
 License: [MIT](LICENSE)

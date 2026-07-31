@@ -42,7 +42,10 @@ Neo4j cannot use randomized ciphertext for meaningful full-text, range, or
 vector similarity search. A future per-vault blind index could support a small
 number of carefully selected exact matches, but it would leak equality.
 Embeddings are sensitive derivatives and cannot remain conventionally
-encrypted while also supporting ordinary vector search.
+encrypted while also supporting ordinary Neo4j vector search. A future trusted
+retriever could decrypt embeddings only from scopes granted to one session,
+build a temporary in-memory index, and destroy it at session end. That
+retriever is not implemented.
 
 A compromised trusted broker can capture active DEKs and plaintext. Encryption
 cannot protect data from the component that is currently authorized to decrypt
@@ -118,6 +121,12 @@ The identity-provider subject-to-owner mapping should remain outside Neo4j.
 Do not use names, emails, government identifiers, customer/account numbers, or
 other PII as `principal_id` or `vault_id`.
 
+The current vault also has only one private DEK. A live context can therefore
+decrypt every private record in that vault. Returning fewer records limits
+disclosure but does not create cryptographic compartments. The planned
+protection-scope and pluggable-unlock design is documented in
+[CHATBOT_GRAPHRAG_DESIGN.md](CHATBOT_GRAPHRAG_DESIGN.md).
+
 ## Layered public graph and private overlays
 
 `LayeredGraphService` keeps the existing encrypted storage path unchanged and
@@ -191,7 +200,11 @@ failed write leaves neither. Successful connections can still create duplicate
 anchors, and anchors count toward the snapshot limit. Production needs a
 deduplicated external-reference design.
 
-## Unlock and session flow
+## Required host-application unlock and session flow
+
+The current Python library implements the key-envelope, unlock, and in-memory
+broker operations. It does not implement the login, browser, HTTP, cookie,
+password-form, MFA, passkey, or one-time-code parts in this flow.
 
 ```text
 1. User authenticates to the application, preferably with MFA/passkeys.
@@ -210,6 +223,13 @@ deduplicated external-reference design.
 10. Logout, timeout, password change, revocation, or restart prevents a future
     operation from acquiring a session key lease.
 ```
+
+An email code must not be used as a KEK or entered in chatbot text. A future
+email-code option would verify a short-lived challenge outside the model and
+authorize a trusted KMS/key service to release only policy-approved keys.
+Email is a lower-assurance channel and is not accepted as out-of-band
+authentication by current NIST digital identity guidance. Prefer passkeys or
+an identity provider with MFA for sensitive deployments.
 
 Expiry is enforced synchronously whenever a token asks for a lease. The broker
 also sweeps and best-effort zeroes expired resident DEKs every second by
@@ -241,8 +261,8 @@ and no credential storage in browser `localStorage` or `sessionStorage`.
 
 ## Neo4j complete mediation
 
-All repository operations require both `principal_id` and `vault_id`. Every
-Neo4j query:
+All private repository operations require both `principal_id` and `vault_id`.
+Every private Neo4j query:
 
 - is a fixed application template;
 - uses parameters rather than string concatenation;
@@ -296,6 +316,9 @@ still use trusted-certificate verification such as `neo4j+s`.
 
 ## Future AI integration contract
 
+The broader target architecture and implementation order are in
+[CHATBOT_GRAPHRAG_DESIGN.md](CHATBOT_GRAPHRAG_DESIGN.md).
+
 The AI must have:
 
 - no database driver or Neo4j credentials;
@@ -330,6 +353,10 @@ query and the configured bounds. It cannot detect a hostile storage actor that
 deletes a row or removes the label, vault metadata, or ownership edge needed
 to make that row query-visible; that requires an authenticated inventory
 outside the mutable graph.
+
+The current API has no update or delete operations. It also has no GraphRAG
+retriever, embedding provider, vector index, model tool executor, or AI write
+path.
 
 ## Tests required before real data
 
