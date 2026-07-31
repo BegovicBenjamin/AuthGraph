@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import base64
 import threading
+import unicodedata
 from dataclasses import replace
 
+from .crypto import NONCE_BYTES
+from .errors import IntegrityViolation
 from .models import (
     EncryptedEntityRow,
     EncryptedNeighborhoodRow,
@@ -13,8 +16,127 @@ from .models import (
     EncryptedRelationshipRow,
     EncryptedVaultSnapshotRow,
     KeyEnvelope,
+    ProtectionScopeRow,
+    ScopeKeyEnvelope,
+    ScopedEncryptedEntityRow,
+    ScopedEncryptedRelationshipRow,
+    ScopedEncryptedVaultSnapshotRow,
     VaultRow,
 )
+from .scoped_crypto import (
+    SCOPE_DEK_CIPHERTEXT_BYTES,
+    SCOPE_ENVELOPE_VERSION,
+    SCOPE_WRAPPING_ALGORITHM,
+)
+from .scoped_sessions import MAX_SCOPES_PER_SESSION
+
+
+MAX_OPAQUE_ID_CHARS = 256
+AES_GCM_TAG_BYTES = 16
+SCOPED_PAYLOAD_VERSION = 2
+SCOPED_PAYLOAD_ALGORITHM = "AES-256-GCM"
+
+
+def _valid_opaque_id(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and len(value) <= MAX_OPAQUE_ID_CHARS
+        and not any(
+            unicodedata.category(char).startswith("C")
+            for char in value
+        )
+    )
+
+
+def _valid_scope_ids(scope_ids: object) -> bool:
+    return (
+        isinstance(scope_ids, tuple)
+        and 0 < len(scope_ids) <= MAX_SCOPES_PER_SESSION
+        and all(_valid_opaque_id(scope_id) for scope_id in scope_ids)
+        and len(set(scope_ids)) == len(scope_ids)
+    )
+
+
+def _valid_scope_envelope(envelope: object) -> bool:
+    return (
+        isinstance(envelope, ScopeKeyEnvelope)
+        and type(envelope.version) is int
+        and envelope.version == SCOPE_ENVELOPE_VERSION
+        and type(envelope.root_key_version) is int
+        and envelope.root_key_version > 0
+        and type(envelope.scope_key_version) is int
+        and envelope.scope_key_version > 0
+        and envelope.algorithm == SCOPE_WRAPPING_ALGORITHM
+        and isinstance(envelope.nonce, bytes)
+        and len(envelope.nonce) == NONCE_BYTES
+        and isinstance(envelope.wrapped_scope_dek, bytes)
+        and len(envelope.wrapped_scope_dek) == SCOPE_DEK_CIPHERTEXT_BYTES
+    )
+
+
+def _valid_scoped_payload(payload: object) -> bool:
+    return (
+        isinstance(payload, EncryptedPayload)
+        and type(payload.version) is int
+        and payload.version == SCOPED_PAYLOAD_VERSION
+        and type(payload.key_version) is int
+        and payload.key_version > 0
+        and payload.algorithm == SCOPED_PAYLOAD_ALGORITHM
+        and isinstance(payload.nonce, bytes)
+        and len(payload.nonce) == NONCE_BYTES
+        and isinstance(payload.ciphertext, bytes)
+        and len(payload.ciphertext) >= AES_GCM_TAG_BYTES
+    )
+
+
+def _valid_protection_scope_row(
+    row: object,
+    *,
+    vault_id: str,
+    scope_id: str | None = None,
+) -> bool:
+    return (
+        isinstance(row, ProtectionScopeRow)
+        and row.vault_id == vault_id
+        and _valid_opaque_id(row.scope_id)
+        and (scope_id is None or row.scope_id == scope_id)
+        and _valid_scope_envelope(row.envelope)
+    )
+
+
+def _valid_scoped_entity_row(
+    row: object,
+    *,
+    vault_id: str,
+    expected_key_version: int,
+) -> bool:
+    return (
+        isinstance(row, ScopedEncryptedEntityRow)
+        and row.vault_id == vault_id
+        and _valid_opaque_id(row.scope_id)
+        and _valid_opaque_id(row.entity_id)
+        and _valid_scoped_payload(row.payload)
+        and row.payload.key_version == expected_key_version
+    )
+
+
+def _valid_scoped_relationship_row(
+    row: object,
+    *,
+    vault_id: str,
+    expected_key_version: int,
+) -> bool:
+    return (
+        isinstance(row, ScopedEncryptedRelationshipRow)
+        and row.vault_id == vault_id
+        and _valid_opaque_id(row.scope_id)
+        and _valid_opaque_id(row.relationship_id)
+        and _valid_opaque_id(row.from_entity_id)
+        and _valid_opaque_id(row.to_entity_id)
+        and _valid_scoped_payload(row.payload)
+        and row.payload.key_version == expected_key_version
+    )
 
 
 class InMemoryGraphRepository:
@@ -25,6 +147,15 @@ class InMemoryGraphRepository:
         self._entities: dict[tuple[str, str], EncryptedEntityRow] = {}
         self._relationships: dict[
             tuple[str, str], EncryptedRelationshipRow
+        ] = {}
+        self._protection_scopes: dict[
+            tuple[str, str], ProtectionScopeRow
+        ] = {}
+        self._scoped_entities: dict[
+            tuple[str, str], ScopedEncryptedEntityRow
+        ] = {}
+        self._scoped_relationships: dict[
+            tuple[str, str], ScopedEncryptedRelationshipRow
         ] = {}
         self._lock = threading.RLock()
 
@@ -42,6 +173,27 @@ class InMemoryGraphRepository:
                 envelope_revision is not None
                 and row.envelope.envelope_revision != envelope_revision
             )
+        ):
+            return None
+        return row
+
+    def _owned_scoped_vault(
+        self,
+        principal_id: str,
+        vault_id: str,
+        envelope_revision: int | None = None,
+    ) -> VaultRow | None:
+        row = self._owned_vault(
+            principal_id,
+            vault_id,
+            envelope_revision,
+        )
+        if (
+            row is None
+            or not isinstance(row, VaultRow)
+            or not isinstance(row.envelope, KeyEnvelope)
+            or type(row.envelope.version) is not int
+            or row.envelope.version != 2
         ):
             return None
         return row
@@ -70,6 +222,15 @@ class InMemoryGraphRepository:
                 row is None
                 or row.envelope.envelope_revision != expected_revision
                 or envelope.envelope_revision != expected_revision + 1
+                or (
+                    row.envelope.version == 2
+                    and (
+                        type(envelope.version) is not int
+                        or envelope.version != 2
+                        or type(envelope.key_version) is not int
+                        or envelope.key_version != row.envelope.key_version
+                    )
+                )
             ):
                 return False
             self._vaults[vault_id] = replace(row, envelope=envelope)
@@ -270,6 +431,355 @@ class InMemoryGraphRepository:
                 relationships=relationships,
             )
 
+    def put_protection_scope(
+        self,
+        principal_id: str,
+        vault_id: str,
+        envelope_revision: int,
+        row: ProtectionScopeRow,
+    ) -> bool:
+        with self._lock:
+            vault = self._owned_scoped_vault(
+                principal_id,
+                vault_id,
+                envelope_revision,
+            )
+            if not _valid_protection_scope_row(row, vault_id=vault_id):
+                return False
+            key = (vault_id, row.scope_id)
+            if (
+                vault is None
+                or row.envelope.root_key_version
+                != vault.envelope.key_version
+                or any(
+                    stored_scope_id == row.scope_id
+                    for _, stored_scope_id in self._protection_scopes
+                )
+            ):
+                return False
+            self._protection_scopes[key] = row
+            return True
+
+    def get_protection_scopes(
+        self,
+        principal_id: str,
+        vault_id: str,
+        envelope_revision: int,
+        scope_ids: tuple[str, ...],
+    ) -> tuple[ProtectionScopeRow, ...] | None:
+        if not _valid_scope_ids(scope_ids):
+            return None
+        with self._lock:
+            vault = self._owned_scoped_vault(
+                principal_id,
+                vault_id,
+                envelope_revision,
+            )
+            if vault is None:
+                return None
+            rows: list[ProtectionScopeRow] = []
+            for scope_id in scope_ids:
+                row = self._protection_scopes.get((vault_id, scope_id))
+                if row is None:
+                    continue
+                if (
+                    not _valid_protection_scope_row(
+                        row,
+                        vault_id=vault_id,
+                        scope_id=scope_id,
+                    )
+                    or row.envelope.root_key_version
+                    != vault.envelope.key_version
+                ):
+                    raise IntegrityViolation()
+                rows.append(row)
+            return tuple(rows)
+
+    def put_scoped_entity(
+        self,
+        principal_id: str,
+        vault_id: str,
+        envelope_revision: int,
+        row: ScopedEncryptedEntityRow,
+    ) -> bool:
+        with self._lock:
+            if (
+                not isinstance(row, ScopedEncryptedEntityRow)
+                or row.vault_id != vault_id
+                or not _valid_opaque_id(row.scope_id)
+                or not _valid_opaque_id(row.entity_id)
+                or not _valid_scoped_payload(row.payload)
+            ):
+                return False
+            vault = self._owned_scoped_vault(
+                principal_id,
+                vault_id,
+                envelope_revision,
+            )
+            scope = self._protection_scopes.get(
+                (vault_id, row.scope_id)
+            )
+            key = (vault_id, row.entity_id)
+            if (
+                vault is None
+                or not _valid_protection_scope_row(
+                    scope,
+                    vault_id=vault_id,
+                    scope_id=row.scope_id,
+                )
+                or scope.envelope.root_key_version
+                != vault.envelope.key_version
+                or row.payload.key_version
+                != scope.envelope.scope_key_version
+                or any(
+                    stored_entity_id == row.entity_id
+                    for _, stored_entity_id in self._scoped_entities
+                )
+            ):
+                return False
+            self._scoped_entities[key] = row
+            return True
+
+    def get_scoped_entity(
+        self,
+        principal_id: str,
+        vault_id: str,
+        envelope_revision: int,
+        allowed_scope_ids: tuple[str, ...],
+        entity_id: str,
+    ) -> ScopedEncryptedEntityRow | None:
+        if not _valid_scope_ids(allowed_scope_ids):
+            return None
+        with self._lock:
+            if (
+                self._owned_scoped_vault(
+                    principal_id,
+                    vault_id,
+                    envelope_revision,
+                )
+                is None
+            ):
+                return None
+            row = self._scoped_entities.get((vault_id, entity_id))
+            if row is None:
+                return None
+            if not isinstance(row, ScopedEncryptedEntityRow):
+                raise IntegrityViolation()
+            if row.scope_id not in allowed_scope_ids:
+                return None
+            scope = self._protection_scopes.get(
+                (vault_id, row.scope_id)
+            )
+            if scope is None:
+                return None
+            if (
+                not _valid_protection_scope_row(
+                    scope,
+                    vault_id=vault_id,
+                    scope_id=row.scope_id,
+                )
+                or not _valid_scoped_entity_row(
+                    row,
+                    vault_id=vault_id,
+                    expected_key_version=scope.envelope.scope_key_version,
+                )
+                or row.entity_id != entity_id
+            ):
+                raise IntegrityViolation()
+            return row
+
+    def put_scoped_relationship(
+        self,
+        principal_id: str,
+        vault_id: str,
+        envelope_revision: int,
+        allowed_scope_ids: tuple[str, ...],
+        row: ScopedEncryptedRelationshipRow,
+    ) -> bool:
+        if (
+            not _valid_scope_ids(allowed_scope_ids)
+            or not isinstance(row, ScopedEncryptedRelationshipRow)
+            or row.vault_id != vault_id
+            or row.scope_id not in allowed_scope_ids
+            or not _valid_opaque_id(row.scope_id)
+            or not _valid_opaque_id(row.relationship_id)
+            or not _valid_opaque_id(row.from_entity_id)
+            or not _valid_opaque_id(row.to_entity_id)
+            or not _valid_scoped_payload(row.payload)
+        ):
+            return False
+        with self._lock:
+            key = (vault_id, row.relationship_id)
+            vault = self._owned_scoped_vault(
+                principal_id,
+                vault_id,
+                envelope_revision,
+            )
+            relationship_scope = self._protection_scopes.get(
+                (vault_id, row.scope_id)
+            )
+            source = self._scoped_entities.get(
+                (vault_id, row.from_entity_id)
+            )
+            target = self._scoped_entities.get(
+                (vault_id, row.to_entity_id)
+            )
+            if (
+                vault is None
+                or not _valid_protection_scope_row(
+                    relationship_scope,
+                    vault_id=vault_id,
+                    scope_id=row.scope_id,
+                )
+                or relationship_scope.envelope.root_key_version
+                != vault.envelope.key_version
+                or row.payload.key_version
+                != relationship_scope.envelope.scope_key_version
+                or source is None
+                or target is None
+                or not isinstance(source, ScopedEncryptedEntityRow)
+                or not isinstance(target, ScopedEncryptedEntityRow)
+                or source.vault_id != vault_id
+                or target.vault_id != vault_id
+                or source.entity_id != row.from_entity_id
+                or target.entity_id != row.to_entity_id
+                or not _valid_opaque_id(source.scope_id)
+                or not _valid_opaque_id(target.scope_id)
+                or (
+                    vault_id,
+                    source.scope_id,
+                )
+                not in self._protection_scopes
+                or (
+                    vault_id,
+                    target.scope_id,
+                )
+                not in self._protection_scopes
+                or source.scope_id not in allowed_scope_ids
+                or target.scope_id not in allowed_scope_ids
+                or any(
+                    stored_relationship_id == row.relationship_id
+                    for _, stored_relationship_id in self._scoped_relationships
+                )
+            ):
+                return False
+            self._scoped_relationships[key] = row
+            return True
+
+    def get_scoped_vault_snapshot(
+        self,
+        principal_id: str,
+        vault_id: str,
+        envelope_revision: int,
+        allowed_scope_ids: tuple[str, ...],
+        *,
+        entity_limit: int,
+        relationship_limit: int,
+    ) -> ScopedEncryptedVaultSnapshotRow | None:
+        if (
+            type(entity_limit) is not int
+            or entity_limit <= 0
+            or type(relationship_limit) is not int
+            or relationship_limit <= 0
+        ):
+            raise ValueError("Snapshot repository limits must be positive integers.")
+        if not _valid_scope_ids(allowed_scope_ids):
+            return None
+        allowed = frozenset(allowed_scope_ids)
+        with self._lock:
+            if (
+                self._owned_scoped_vault(
+                    principal_id,
+                    vault_id,
+                    envelope_revision,
+                )
+                is None
+            ):
+                return None
+            visible_entities: list[ScopedEncryptedEntityRow] = []
+            for (row_vault, entity_id), row in sorted(
+                self._scoped_entities.items()
+            ):
+                if row_vault != vault_id:
+                    continue
+                if not isinstance(row, ScopedEncryptedEntityRow):
+                    raise IntegrityViolation()
+                if row.scope_id not in allowed:
+                    continue
+                scope = self._protection_scopes.get(
+                    (vault_id, row.scope_id)
+                )
+                if scope is None:
+                    continue
+                if (
+                    not _valid_protection_scope_row(
+                        scope,
+                        vault_id=vault_id,
+                        scope_id=row.scope_id,
+                    )
+                    or not _valid_scoped_entity_row(
+                        row,
+                        vault_id=vault_id,
+                        expected_key_version=(
+                            scope.envelope.scope_key_version
+                        ),
+                    )
+                    or row.entity_id != entity_id
+                ):
+                    raise IntegrityViolation()
+                visible_entities.append(row)
+
+            visible_entity_ids = {
+                row.entity_id for row in visible_entities
+            }
+            visible_relationships: list[
+                ScopedEncryptedRelationshipRow
+            ] = []
+            for (row_vault, relationship_id), row in sorted(
+                self._scoped_relationships.items()
+            ):
+                if row_vault != vault_id:
+                    continue
+                if not isinstance(row, ScopedEncryptedRelationshipRow):
+                    raise IntegrityViolation()
+                if (
+                    row.scope_id not in allowed
+                    or row.from_entity_id not in visible_entity_ids
+                    or row.to_entity_id not in visible_entity_ids
+                ):
+                    continue
+                scope = self._protection_scopes.get(
+                    (vault_id, row.scope_id)
+                )
+                if scope is None:
+                    continue
+                if (
+                    not _valid_protection_scope_row(
+                        scope,
+                        vault_id=vault_id,
+                        scope_id=row.scope_id,
+                    )
+                    or not _valid_scoped_relationship_row(
+                        row,
+                        vault_id=vault_id,
+                        expected_key_version=(
+                            scope.envelope.scope_key_version
+                        ),
+                    )
+                    or row.relationship_id != relationship_id
+                ):
+                    raise IntegrityViolation()
+                visible_relationships.append(row)
+
+            entities = tuple(visible_entities[: entity_limit + 1])
+            relationships = tuple(
+                visible_relationships[: relationship_limit + 1]
+            )
+            return ScopedEncryptedVaultSnapshotRow(
+                entities=entities,
+                relationships=relationships,
+            )
+
     def ciphertext_snapshot(self) -> dict[str, object]:
         """Return storage-shaped ciphertext for assertions—never plaintext."""
 
@@ -323,6 +833,56 @@ class InMemoryGraphRepository:
                         vault_id,
                         relationship_id,
                     ), row in self._relationships.items()
+                ],
+                "protection_scopes": [
+                    {
+                        "vault_id": vault_id,
+                        "scope_id": scope_id,
+                        "envelope": {
+                            "version": row.envelope.version,
+                            "root_key_version": (
+                                row.envelope.root_key_version
+                            ),
+                            "scope_key_version": (
+                                row.envelope.scope_key_version
+                            ),
+                            "algorithm": row.envelope.algorithm,
+                            "nonce": base64.b64encode(
+                                row.envelope.nonce
+                            ).decode("ascii"),
+                            "wrapped_scope_dek": base64.b64encode(
+                                row.envelope.wrapped_scope_dek
+                            ).decode("ascii"),
+                        },
+                    }
+                    for (
+                        vault_id,
+                        scope_id,
+                    ), row in self._protection_scopes.items()
+                ],
+                "scoped_entities": [
+                    {
+                        "vault_id": vault_id,
+                        "scope_id": row.scope_id,
+                        "entity_id": entity_id,
+                        "payload": payload(row.payload),
+                    }
+                    for (
+                        vault_id,
+                        entity_id,
+                    ), row in self._scoped_entities.items()
+                ],
+                "scoped_relationships": [
+                    {
+                        "vault_id": vault_id,
+                        "scope_id": row.scope_id,
+                        "relationship_id": relationship_id,
+                        "payload": payload(row.payload),
+                    }
+                    for (
+                        vault_id,
+                        relationship_id,
+                    ), row in self._scoped_relationships.items()
                 ],
             }
 

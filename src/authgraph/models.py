@@ -89,6 +89,53 @@ class EncryptedVaultSnapshotRow:
     relationships: tuple[EncryptedRelationshipRow, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class ScopeKeyEnvelope:
+    """One random protection-scope DEK wrapped by the vault root DEK."""
+
+    version: int
+    root_key_version: int
+    scope_key_version: int
+    algorithm: str
+    nonce: bytes
+    wrapped_scope_dek: bytes
+
+
+@dataclass(frozen=True, slots=True)
+class ProtectionScopeRow:
+    """Opaque protection scope stored under one owner vault."""
+
+    vault_id: str
+    scope_id: str
+    envelope: ScopeKeyEnvelope
+
+
+@dataclass(frozen=True, slots=True)
+class ScopedEncryptedEntityRow:
+    vault_id: str
+    scope_id: str
+    entity_id: str
+    payload: EncryptedPayload
+
+
+@dataclass(frozen=True, slots=True)
+class ScopedEncryptedRelationshipRow:
+    vault_id: str
+    scope_id: str
+    relationship_id: str
+    from_entity_id: str
+    to_entity_id: str
+    payload: EncryptedPayload
+
+
+@dataclass(frozen=True, slots=True)
+class ScopedEncryptedVaultSnapshotRow:
+    """A bounded ciphertext snapshot from only session-granted scopes."""
+
+    entities: tuple[ScopedEncryptedEntityRow, ...]
+    relationships: tuple[ScopedEncryptedRelationshipRow, ...]
+
+
 class ProtectionLevel(StrEnum):
     """Application-layer storage choice for a graph record.
 
@@ -181,6 +228,36 @@ class VaultSnapshot:
 
     entities: tuple[Entity, ...]
     relationships: tuple[Relationship, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ScopedEntity:
+    """Decrypted entity plus its opaque cryptographic protection scope."""
+
+    entity_id: str
+    scope_id: str
+    kind: str
+    properties: Mapping[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class ScopedRelationship:
+    """Decrypted relationship plus its own protection scope."""
+
+    relationship_id: str
+    scope_id: str
+    from_entity_id: str
+    to_entity_id: str
+    kind: str
+    properties: Mapping[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class ScopedVaultSnapshot:
+    """Plaintext from only the scopes granted to one secure session."""
+
+    entities: tuple[ScopedEntity, ...]
+    relationships: tuple[ScopedRelationship, ...]
 
 
 @dataclass(frozen=True, slots=True)

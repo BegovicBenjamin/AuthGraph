@@ -196,6 +196,7 @@ class InMemorySessionBroker:
         envelope_revision: int,
         key_version: int,
         ttl_seconds: int | None = None,
+        not_after: float | None = None,
     ) -> AccessContext:
         """Open a session while serialized against vault lifecycle changes."""
 
@@ -207,6 +208,7 @@ class InMemorySessionBroker:
                 envelope_revision=envelope_revision,
                 key_version=key_version,
                 ttl_seconds=ttl_seconds,
+                not_after=not_after,
             )
 
     def _open_under_guard(
@@ -218,10 +220,16 @@ class InMemorySessionBroker:
         envelope_revision: int,
         key_version: int,
         ttl_seconds: int | None = None,
+        not_after: float | None = None,
     ) -> AccessContext:
         ttl = self._default_ttl if ttl_seconds is None else ttl_seconds
         if type(ttl) is not int or ttl <= 0 or ttl > self._max_ttl:
             raise ValidationError("Requested secure-session TTL is not allowed.")
+        if not_after is not None and (
+            type(not_after) not in (int, float)
+            or not math.isfinite(not_after)
+        ):
+            raise ValidationError("Invalid absolute session expiry.")
         if (
             not isinstance(principal_id, str)
             or not principal_id
@@ -241,6 +249,11 @@ class InMemorySessionBroker:
             raise ValidationError("Invalid vault key material.")
         now = self._clock()
         if type(now) not in (int, float) or not math.isfinite(now):
+            raise SessionUnavailable()
+        expires_at = now + ttl
+        if not_after is not None:
+            expires_at = min(expires_at, float(not_after))
+        if not math.isfinite(expires_at) or expires_at <= now:
             raise SessionUnavailable()
         stale_revision = False
         with self._lock:
@@ -284,7 +297,7 @@ class InMemorySessionBroker:
                         envelope_revision=envelope_revision,
                         key_version=key_version,
                         dek=bytearray(dek),
-                        expires_at=now + ttl,
+                        expires_at=expires_at,
                     )
         if stale_revision:
             raise SessionUnavailable()

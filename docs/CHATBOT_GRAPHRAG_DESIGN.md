@@ -1,6 +1,6 @@
 # AuthGraph for chatbots and GraphRAG
 
-This is the target design. It is not all implemented yet.
+This is the target design and the status of its first implementation slice.
 
 The goal is simple:
 
@@ -12,24 +12,25 @@ The goal is simple:
 | Capability | Status |
 |---|---|
 | Public nodes and connections | Available |
-| Encrypted private nodes and connections | Available |
-| One owner vault per secure session | Available |
-| Session TTL, lock, revocation, and process-restart lock | Available in one process |
-| Public-only and public-plus-one-owner views | Available for small graphs |
-| Model-safe targeted GraphRAG retriever | Planned |
-| Configurable disclosure profiles | Planned |
-| Separate keys for named private protection scopes | Planned |
-| Password, passkey, identity-provider, and code provider interface | Planned |
-| Email code delivery | Planned host integration |
-| Encrypted embeddings with a temporary session index | Planned |
+| Legacy whole-vault encryption | Available as v1 |
+| Separate random keys for opaque protection scopes | Available as v2 |
+| Session holds only policy-granted scope keys | Available in one process |
+| Password unlock for selected scopes | Available |
+| Fixed OTP disclosure profiles and single-use grants | Available in memory |
+| Pluggable scope-key enrollment/release interface | Available |
+| Real KMS/HSM provider | Host integration required |
+| Email/SMS delivery | Host integration required |
+| Bounded lexical GraphRAG and graph traversal | Available |
+| Per-kind property allowlists and provenance | Available |
+| Temporary in-memory vector index | Available; host-managed lifetime |
+| Encrypted embedding storage/loading and embedding model | Planned |
+| Passkey and identity-provider adapters | Planned |
 | Production web authentication, auditing, and multi-server sessions | Planned |
 
-Current AuthGraph has one encryption key for a complete owner vault. Once that
-vault is unlocked, the trusted backend can technically decrypt every private
-record in it. It may return fewer records, but that is filtering rather than a
-cryptographic boundary.
-
-The target design fixes this with separate **protection scopes**.
+AuthGraph keeps two formats separate. `AuthGraphService` is the legacy v1
+whole-vault format. `ScopedAuthGraphService` is v2: it gives every protection
+scope an independent random key and places only granted scope keys in a
+session. There is no v1-to-v2 migration yet.
 
 ## The trust boundary
 
@@ -79,8 +80,10 @@ authenticated account to an opaque AuthGraph vault outside the conversation.
 
 ## Public data, owner vaults, and protection scopes
 
-One Neo4j database may hold many owners. Each owner has one vault. A vault may
-contain several private protection scopes:
+One Neo4j database may hold many owner vaults. Every vault has one owner, and
+the library permits one principal to have multiple vaults. If your product
+wants exactly one vault per account, its backend must enforce that policy. A
+vault may contain several private protection scopes:
 
 ```text
 Shared public graph
@@ -94,12 +97,12 @@ Owner vault
   - private_notes
 ```
 
-These names are configuration labels. Neo4j should store opaque scope IDs so a
-database reader does not learn that a scope is called `medical` or
-`private_notes`.
+These names stay in trusted application configuration. AuthGraph stores opaque
+scope IDs so a database reader does not learn that a scope is called `medical`
+or `private_notes`.
 
-Every private scope gets its own random 256-bit data-encryption key. Every
-private node and connection is assigned to exactly one scope and encrypted
+Every v2 private scope gets its own random 256-bit data-encryption key. Every
+v2 private node and connection is assigned to exactly one scope and encrypted
 before it reaches Neo4j.
 
 This gives a real boundary:
@@ -141,11 +144,17 @@ policies:
     session_ttl_seconds: 180
 ```
 
-This format is illustrative; it is not a supported configuration file yet.
+This YAML is illustrative; policy objects are currently configured in Python
+with `UnlockProfile`, `ScopeGrantPolicy`, and `DisclosurePolicy`.
 
-The policy may require one factor, every factor in `all_of`, or an approved
-choice in `any_of`. This is authentication policy, not threshold cryptography.
-The trusted backend evaluates it. The AI cannot weaken or replace it.
+The current `UnlockProfile` supports one fixed scope set, TTL, and an
+`allow_one_time_code` switch. Rich `all_of`/`any_of` policies remain planned.
+This is authentication policy, not threshold cryptography. The trusted backend
+evaluates it. The AI cannot weaken or replace it.
+
+`UnlockProfile` currently governs the OTP exchange. Direct password unlock
+accepts the exact scope tuple supplied by its trusted backend caller, so the
+host must enforce the password disclosure policy before calling it.
 
 Recommended provider types:
 
@@ -162,12 +171,13 @@ security code.
 
 ## Password unlock
 
-The current password design can be extended to scopes:
+The v2 password flow is implemented:
 
 1. Derive a key-encryption key from the password with Argon2id.
-2. Use it to unwrap only the scope keys granted by policy.
-3. Put those scope keys in the server-side session.
-4. Clear temporary password and key buffers best-effort.
+2. Use it to unwrap one random vault-wrapping key.
+3. Use that key to unwrap only the scope keys chosen by trusted policy.
+4. Put only those scope keys in the server-side session.
+5. Clear temporary key buffers best-effort.
 
 The password must go to a dedicated secure endpoint or form. It must never be
 entered into chatbot text, sent to the model, or included in model tool
@@ -179,25 +189,29 @@ A short code must never be used directly as an encryption key. Six or eight
 digits can be guessed and do not contain enough entropy to protect stored
 data.
 
-The safe pattern is:
+The library implements the challenge, verifier, fixed grant policy, and key
+provider boundary in memory. The safe pattern is:
 
 1. The user already has an application session.
 2. The host asks AuthGraph to begin a challenge for a fixed disclosure policy.
 3. The address comes from a previously verified account record, not chat text.
 4. A cryptographically random, short-lived, single-use code is generated.
-5. Only a protected verifier is stored, bound to the principal, policy,
-   browser transaction, expiry, and challenge.
-6. The host application's mail adapter sends the code.
+5. Only a protected verifier is stored, bound to the principal, policy, opaque
+   vault context, browser transaction, authorization epoch, expiry, and
+   challenge.
+6. The host application's mail adapter sends the code; AuthGraph does not.
 7. A secure form submits the code directly to the verifier.
 8. Rate limits and attempt limits are enforced and consumption is atomic.
-9. Successful verification authorizes a trusted KMS/key service to unwrap only
-   the permitted scope keys.
-10. AuthGraph creates an opaque, short-lived session grant.
+9. Successful verification creates broker-authenticated evidence exactly once.
+10. Policy exchanges it for a single-use scope grant.
+11. AuthGraph consumes that grant, asks the trusted KMS/key service for only
+    those scope keys, and returns an opaque, short-lived `AccessContext`.
 
 The code authorizes key release; it does not mathematically derive the key.
-This requires a server/KMS-controlled key wrap in addition to a password wrap.
-If a key is protected only by the current password envelope, an email code
-cannot decrypt it.
+The included `InMemoryScopeKeyProvider` demonstrates a second provider wrap
+but is not production key custody. A real deployment needs a KMS/HSM adapter.
+If a key is protected only by the password envelope, an email code cannot
+decrypt it.
 
 Email codes are customizable but must be labeled as a lower-assurance option.
 Current NIST digital identity guidance does not accept email as an out-of-band
@@ -215,7 +229,9 @@ References:
 The decrypted graph is a virtual view in trusted memory. It is never written
 back to Neo4j as plaintext.
 
-A future `SessionVisibleGraphGateway` should combine:
+`ScopedGraphViewAdapter` requests a bounded complete snapshot of only the
+scopes present in the current v2 session and decrypts it in trusted memory.
+`SessionVisibleGraphGateway` then combines:
 
 ```text
 allowed public records
@@ -224,30 +240,32 @@ records encrypted by scope keys in this session
         -
 disallowed kinds and properties
         -
-records outside count, byte, token, hop, and time limits
+records outside count, byte-estimate, token-estimate, and hop limits
 ```
 
-Every disclosure profile can configure:
+`DisclosurePolicy` currently configures:
 
-- granted protection scopes;
-- allowed operations;
 - allowed node and connection kinds;
-- property allowlists and redaction;
+- property allowlists;
 - maximum search candidates;
 - maximum returned nodes and connections;
 - maximum traversal depth;
-- maximum plaintext bytes and estimated model tokens;
-- maximum retrieval time;
-- session lifetime; and
-- whether full authorized-scope access is allowed at all.
+- maximum complete serialized plaintext bytes; and
+- a deterministic byte-based token estimate.
 
-Two useful modes are:
+Scope grants and session lifetime are configured separately. The token estimate
+is not a model tokenizer result; the host must enforce the selected model's
+real prompt limit before sending a payload.
 
-- `targeted`: return only a small subgraph relevant to one question;
-- `full_authorized_scopes`: expose all records in the granted scopes, within
-  hard limits, for deliberate small-graph tests.
+The gateway returns targeted lexical/vector seeds plus bounded traversal, but
+its current scoped adapter is not a targeted database query: every retrieval
+internally calls `ScopedAuthGraphService.get_vault_snapshot()` for all granted
+scopes before projection and ranking. That bounded full-snapshot method must
+not itself be registered as an AI tool. A future repository-native retriever
+should reduce plaintext handled by the trusted process as well as by the model.
 
-`targeted` should be the production default.
+The adapter's `graph_id` is a logical label, not a private-record filter. The
+session's granted protection scopes are the isolation boundary.
 
 ## GraphRAG request flow
 
@@ -258,7 +276,7 @@ Question
 Fixed AI tool: search_my_authorized_knowledge
    |
    v
-Attach the server-side session grant
+Attach the server-side `AccessContext`
    |
    v
 Search public data + only granted private scopes
@@ -308,7 +326,7 @@ can also read or analyze them.
 If private embeddings are encrypted, Neo4j cannot directly perform ordinary
 vector similarity search over their ciphertext.
 
-The protected option is:
+The protected target is:
 
 1. Encrypt each embedding with its record's scope key.
 2. After unlock, load embeddings only from granted scopes.
@@ -322,6 +340,14 @@ The temporary index must have owner/session isolation plus item, memory, and
 build-time limits. It trades speed for privacy because it may need rebuilding
 after each unlock.
 
+`SessionVisibleGraphGateway.build_vector_index()` now creates a bounded
+in-memory cosine index from only the gateway's policy-allowlisted entity
+projection. It seals the index to that gateway and exact context, so raw or
+cross-context indexes fail closed. AuthGraph does not yet provide an embedding
+model, store encrypted embeddings, load them by scope, or close an index
+automatically on session revocation. The host must close each index inside the
+secure-session lifetime.
+
 Intentionally public embeddings may use Neo4j's normal vector index.
 
 Neo4j's current vector indexes require readable numeric vector properties:
@@ -329,7 +355,8 @@ Neo4j's current vector indexes require readable numeric vector properties:
 
 ## Session end
 
-Lock, expiry, logout, revocation, or restart must clear, best-effort:
+The target is for lock, expiry, logout, revocation, or restart to clear,
+best-effort:
 
 - scope keys;
 - decrypted record caches;
@@ -338,6 +365,10 @@ Lock, expiry, logout, revocation, or restart must clear, best-effort:
 - sensitive server-side conversation state.
 
 It must also block every future retrieval with the old session.
+
+Scope-key sessions and OTP state implement this single-process lifecycle.
+Temporary vector-index cleanup still belongs to the host and is therefore not
+yet an automatic guarantee.
 
 This cannot make an external AI forget plaintext already sent to it. The model
 may repeat that plaintext from the current conversation, and the provider may
@@ -369,10 +400,10 @@ A safe write flow is:
 Updates, deletes, classification changes, and AI write tools are not currently
 implemented.
 
-## Proposed internal model
+## Internal model
 
-The following names describe the intended architecture, not today's Python
-API:
+The first slice now implements these concepts, although production policy and
+key providers remain incomplete:
 
 ```text
 ProtectionScope
@@ -410,48 +441,23 @@ Changing a credential, scope key, key slot, or grant policy should increment a
 vault security revision and revoke old sessions. Multi-server deployments need
 shared durable revision and revocation state.
 
-## Build order
+## What is next
 
-### 1. Model-safe retrieval over the current vault key
+The first vertical slice now includes real scope keys, fixed scoped Neo4j
+queries, password and OTP-authorized sessions, disclosure policies, bounded
+retrieval, provenance, and a temporary vector helper.
 
-- Add disclosure profiles.
-- Add the session-visible graph gateway.
-- Add fixed, targeted, bounded retrieval.
-- Remove full-vault snapshots from model-selectable paths.
+The next work is:
 
-This improves disclosure control but is not cryptographic scope isolation.
+1. Run schema and v2 flows against a real Neo4j 5.7+ server.
+2. Add a production KMS/HSM scope-key provider and real passkey/IdP adapters.
+3. Add the host HTTP security layer, delivery adapter, rate limits, and audit
+   events.
+4. Store embeddings encrypted per scope and automatically destroy temporary
+   indexes with their sessions.
+5. Add migration, key rotation, recovery, update/delete, multi-process
+   revocation, and external anti-rollback state.
+6. Perform independent security and privacy review.
 
-### 2. Real protection scopes
-
-- Add independent scope keys and key slots.
-- Add scope-aware authenticated encryption and fixed Neo4j queries.
-- Store only opaque scope IDs.
-- Change sessions from one vault key to a map of granted scope keys.
-- Add a migration path for existing vaults.
-
-### 3. Pluggable unlock evidence
-
-- Add provider, challenge, evidence, and grant-policy interfaces.
-- Keep passwords and codes out of chat.
-- Add passphrase unlock for selected scopes.
-- Add KMS-backed passkey/identity-provider integrations.
-- Add optional lower-assurance email confirmation through a host mail adapter.
-
-### 4. GraphRAG
-
-- Add targeted text/graph retrieval.
-- Add bounded traversal, field redaction, provenance, and prompt budgets.
-- Add optional encrypted embeddings and temporary private indexes.
-- Add prompt-injection and cross-owner isolation tests.
-
-### 5. Production hardening
-
-- Live Neo4j integration and migration tests
-- Multi-process sessions, revision fencing, and revocation
-- Rate limiting and replay-safe challenge storage
-- Structured security audit events
-- Key rotation, recovery, backup, and deletion workflows
-- Independent security and privacy review
-
-Until these milestones are complete, AuthGraph remains a synthetic-data
-prototype rather than a production security product.
+Until that work is complete, AuthGraph remains a synthetic-data prototype
+rather than a production security product.

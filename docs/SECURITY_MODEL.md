@@ -15,15 +15,18 @@ compliance.
    a vault secret. Records explicitly classified `PUBLIC` are intentionally
    plaintext at AuthGraph's application-encryption layer.
 2. A principal can retrieve records only from the vault bound to that
-   principal's secure session.
+   principal's secure session. A v2 session can decrypt only its explicitly
+   granted protection scopes.
 3. A passphrase, KEK, DEK, Neo4j credential, or session token never enters an
    LLM prompt, tool argument, graph property, application log, or audit event.
 4. Unlocking one vault never globally decrypts Neo4j.
 5. Modification or truncation of a present ciphertext, record swapping, or
    cross-vault movement fails authenticated decryption.
 6. Expiry, logout, password change, and session revocation prevent the affected
-   session from obtaining a new DEK lease in the supported single-process
-   design. Session revocation does not disable a future password unlock.
+   session from obtaining a new key lease in the supported single-process
+   design. Session revocation does not disable a future valid unlock.
+7. A v2 private relationship is visible only when its relationship scope and
+   both endpoint scopes are granted.
 
 ## Non-goals and unavoidable leakage
 
@@ -32,8 +35,10 @@ Application encryption is not magic searchable encryption.
 Neo4j can see:
 
 - every semantic kind and property deliberately stored in the public layer;
-- opaque principal, vault, entity, and relationship identifiers;
+- opaque principal, vault, scope, entity, and relationship identifiers;
 - that entities belong to the same vault;
+- the number of protection scopes and which protected records share an opaque
+  scope through `AG_HAS_SCOPE` and `AG_PROTECTS` topology;
 - generic connectivity, direction, graph size, and access patterns;
 - ciphertext sizes and key/KDF version metadata; and
 - database operational metadata.
@@ -42,10 +47,11 @@ Neo4j cannot use randomized ciphertext for meaningful full-text, range, or
 vector similarity search. A future per-vault blind index could support a small
 number of carefully selected exact matches, but it would leak equality.
 Embeddings are sensitive derivatives and cannot remain conventionally
-encrypted while also supporting ordinary Neo4j vector search. A future trusted
-retriever could decrypt embeddings only from scopes granted to one session,
-build a temporary in-memory index, and destroy it at session end. That
-retriever is not implemented.
+encrypted while also supporting ordinary Neo4j vector search.
+The gateway can build a sealed `EphemeralVectorIndex` in trusted memory from
+only its policy-allowlisted entity projection. It rejects raw indexes and
+indexes bound to another gateway or context. Encrypted embedding
+storage/loading and automatic session-lifetime cleanup are not implemented.
 
 A compromised trusted broker can capture active DEKs and plaintext. Encryption
 cannot protect data from the component that is currently authorized to decrypt
@@ -73,27 +79,33 @@ serializes raw DEKs, and intentionally locks all vaults on process restart.
 
 ## Key hierarchy
 
-For each vault:
+AuthGraph has two version-fenced formats:
 
-1. Generate a random 256-bit DEK.
-2. Accept a strong passphrase through a dedicated non-chat security interface.
-3. Generate a unique 128-bit salt.
-4. Derive a 256-bit KEK with Argon2id.
-5. Wrap the DEK using AES-256-GCM and AAD containing the principal, vault,
-   envelope format version, envelope revision, and key version.
-6. Store only the salt, KDF parameters, wrap nonce, wrapped DEK, and versions.
-7. Encrypt each entity and relationship independently with the random DEK,
-   a fresh nonce, and object-specific AAD.
+- v1 generates one random 256-bit DEK for the complete private vault.
+- v2 generates one random 256-bit vault-wrapping key plus an independent
+  random 256-bit DEK for every protection scope.
 
-AuthGraph does not persist the password. Password change unwraps the DEK using
-the old password and re-wraps it using the new one. The caller still owns the
-input buffer and must dispose of it after the call.
+For both formats, a dedicated non-chat interface accepts a passphrase,
+Argon2id derives a 256-bit KEK with a unique salt, and AES-256-GCM wraps the
+random vault key. The envelope AAD binds the principal, vault, format version,
+envelope revision, key version, KDF metadata, and salt.
 
-Re-wrapping is not cryptographic recovery from compromise. Anyone who copied
-the old DEK can decrypt old and future records while the vault keeps using that
-DEK, regardless of a later passphrase change. Suspected passphrase, envelope,
-or DEK compromise requires generating a new DEK and re-encrypting every vault
-record; that rotation workflow is not implemented in this prototype.
+In v2, the random vault key wraps scope DEKs but never encrypts graph records
+directly. Each node or connection is encrypted by its assigned scope DEK with
+a fresh nonce. AAD binds its owner, vault, scope, object ID, version, and—for a
+relationship—direction, endpoints, and endpoint scopes.
+
+AuthGraph stores neither the password nor raw keys in Neo4j. Password change
+unwraps and re-wraps the same vault key, increments the authorization epoch,
+revokes older local sessions, and makes older grants unusable at provider
+unlock; those grant objects remain in the in-memory policy until consumption
+or expiry. Scope keys and record ciphertext do not change. The caller still
+owns and must dispose of the passphrase input.
+
+Re-wrapping is not cryptographic recovery from compromise. Anyone who copied a
+vault or scope key keeps the corresponding decrypt capability. Suspected key
+compromise requires rotation and re-encryption; that workflow is not
+implemented.
 
 This has two important consequences:
 
@@ -101,9 +113,10 @@ This has two important consequences:
   but cannot make a weak password safe. Authentication rate limiting does not
   stop offline attacks. A production design should consider a second
   server/HSM-controlled factor.
-- With no recovery wrap, losing the password or corrupting envelope metadata
-  permanently loses the data. A break-glass or recovery key is a product,
-  governance, and legal decision—not something to improvise later.
+- With no enrolled alternative provider or recovery wrap, losing the password
+  or corrupting key metadata can permanently lose the data. A break-glass or
+  recovery key is a product, governance, and legal decision—not something to
+  improvise later.
 
 ## Owner and delegated access
 
@@ -121,10 +134,10 @@ The identity-provider subject-to-owner mapping should remain outside Neo4j.
 Do not use names, emails, government identifiers, customer/account numbers, or
 other PII as `principal_id` or `vault_id`.
 
-The current vault also has only one private DEK. A live context can therefore
-decrypt every private record in that vault. Returning fewer records limits
-disclosure but does not create cryptographic compartments. The planned
-protection-scope and pluggable-unlock design is documented in
+Legacy v1 still has one private DEK, so a live v1 context can decrypt the whole
+private vault. V2 creates cryptographic compartments with independent scope
+DEKs. It does not yet implement delegated principals, shared key slots,
+migration, or key rotation. The broader design is in
 [CHATBOT_GRAPHRAG_DESIGN.md](CHATBOT_GRAPHRAG_DESIGN.md).
 
 ## Layered public graph and private overlays
@@ -192,6 +205,12 @@ unrelated records enter trusted transient memory and count toward the limits.
 Prefer one layered graph per vault in this prototype. Production retrieval
 should ordinarily remain task-specific and return fewer fields.
 
+`ScopedGraphViewAdapter` is the v2 alternative. It requests a snapshot through
+the current scoped session, so ciphertext outside its granted scopes cannot be
+decrypted. It returns a relationship only when its own scope and both endpoint
+scopes are present. An optional public provider is validated separately before
+the scoped overlay is merged.
+
 Policies are in-process startup configuration, not persisted or revisioned
 security records. Changing them affects future writes and the badge only. Each
 private edge involving a public endpoint currently creates an encrypted helper
@@ -202,34 +221,53 @@ deduplicated external-reference design.
 
 ## Required host-application unlock and session flow
 
-The current Python library implements the key-envelope, unlock, and in-memory
-broker operations. It does not implement the login, browser, HTTP, cookie,
-password-form, MFA, passkey, or one-time-code parts in this flow.
+The Python library implements key envelopes, password unlock, scoped sessions,
+an in-memory OTP challenge broker, fixed one-time-code profiles, and a
+scope-key-provider interface. It does not implement login, HTTP, cookies,
+password/code forms, email delivery, passkeys, or a production KMS adapter.
 
 ```text
 1. User authenticates to the application, preferably with MFA/passkeys.
 2. Chat receives only an `unlock_required` state.
 3. A dedicated password form posts directly to the key broker over TLS.
-4. The broker retrieves the key envelope using the authenticated principal
+4. The backend retrieves the key envelope using the authenticated principal
    and opaque vault ID.
-5. Argon2id derives a transient KEK; AES-GCM unwraps the vault DEK.
-6. Temporary mutable KEK/DEK buffers owned by the broker are cleared
+5. Argon2id derives a transient KEK; AES-GCM unwraps the v1 DEK or v2
+   vault-wrapping key.
+6. For v2, the backend unwraps only policy-selected scope DEKs.
+7. Temporary mutable KEK/DEK buffers owned by the broker are cleared
    best-effort. The HTTP/caller layer is responsible for disposing of its
    passphrase input buffer.
-7. The DEK enters a short-lived in-memory session bound to principal + vault.
-8. The browser receives a high-entropy opaque cookie, never the DEK.
-9. Every fixed graph operation obtains its vault scope from that server
-   session, not from user text or model-selected arguments.
-10. Logout, timeout, password change, revocation, or restart prevents a future
+8. Only the selected key material enters a short-lived in-memory session bound
+   to principal + vault.
+9. The browser receives a high-entropy opaque cookie, never a key or the
+   internal `AccessContext`.
+10. Every fixed graph operation obtains its vault and scope authority from that
+    server session, not from user text or model-selected arguments.
+11. Logout, timeout, password change, revocation, or restart prevents a future
     operation from acquiring a session key lease.
 ```
 
-An email code must not be used as a KEK or entered in chatbot text. A future
-email-code option would verify a short-lived challenge outside the model and
-authorize a trusted KMS/key service to release only policy-approved keys.
-Email is a lower-assurance channel and is not accepted as out-of-band
-authentication by current NIST digital identity guidance. Prefer passkeys or
-an identity provider with MFA for sensitive deployments.
+A one-time code must not be used as a KEK or entered in chatbot text. The
+in-memory broker stores only an HMAC-keyed verifier, limits attempts, binds the
+challenge to the principal, profile, opaque vault context, browser transaction,
+and current authorization epoch, and produces broker-held evidence that can be
+consumed exactly once.
+The fixed policy then creates a single-use scope grant.
+
+The code only authorizes a trusted provider to release keys. The included
+`InMemoryScopeKeyProvider` uses a random process-local wrap for tests, holds a
+release lease until session creation completes, and loses all capability on
+shutdown. Compromise of that process can expose every enrolled scope, so it is
+not production custody. Its scope/vault revocation methods remove future
+release capability but do not revoke an already opened AuthGraph session; the
+host must revoke both. A real deployment needs KMS/HSM-backed enrollment and
+release plus external issuance rate limits.
+
+Email is only one possible host delivery channel. It is lower assurance and is
+not accepted as out-of-band authentication by current NIST digital identity
+guidance. Prefer passkeys or an identity provider with MFA for sensitive
+deployments.
 
 Expiry is enforced synchronously whenever a token asks for a lease. The broker
 also sweeps and best-effort zeroes expired resident DEKs every second by
@@ -276,6 +314,18 @@ The service verifies both edge endpoints inside the same vault. It intentionally
 uses generic `AGEntity` and `AG_LINK` semantics so a database reader cannot see
 plaintext labels such as `PrivateCategory`, `SensitiveEvent`, or `RELATED_TO`.
 
+V2 uses separate generic labels and links:
+
+```text
+AGProtectionScope / AGScopedEntity / AG_SCOPED_LINK
+```
+
+Its fixed queries also require envelope version 2, the current revision, and
+an exact server-supplied scope allowlist. Scope envelopes bind their root key
+version. Scoped entity payloads bind their scope-key version. A scoped
+relationship read or write requires the relationship scope plus both endpoint
+scopes.
+
 The separate public adapter likewise exposes only fixed, graph-scoped query
 templates. It stores properties as canonical plaintext JSON and never queries
 private labels. Public graph IDs and public object IDs are opaque, bounded
@@ -307,6 +357,9 @@ same-named constraint. Deployment must verify the exact result with
 `SHOW CONSTRAINTS`, prevent all untrusted direct graph writes, and use
 Enterprise existence/key constraints where available.
 
+These queries have recording-driver unit tests but have not yet been parsed,
+executed, or profiled here against a live Neo4j 5.7+ server.
+
 Neo4j/Aura storage encryption, TLS, RBAC, PBAC, private networking, backups,
 and audit controls remain important defense in depth. They are not a
 replacement for this application encryption. Current Neo4j documentation also
@@ -314,7 +367,7 @@ notes that fine-grained controls are tier-dependent. The adapter rejects a
 driver whose `encrypted` property is not explicitly true; production should
 still use trusted-certificate verification such as `neo4j+s`.
 
-## Future AI integration contract
+## AI integration contract
 
 The broader target architecture and implementation order are in
 [CHATBOT_GRAPHRAG_DESIGN.md](CHATBOT_GRAPHRAG_DESIGN.md).
@@ -329,8 +382,21 @@ The AI must have:
 - bounded results; and
 - retrieved records treated as untrusted content that cannot issue commands.
 
-The trusted tool executor attaches principal and vault scope out of band. It
-decrypts only the selected result and returns the minimum necessary fields.
+The trusted tool executor attaches the current context, graph, policy, and
+optional vector index out of band. Register only a wrapper whose model schema
+accepts question text. Do not register the backend
+`SessionVisibleGraphGateway.retrieve()` method directly because it also has
+trusted-only parameters.
+
+The current scoped adapter first decrypts a bounded complete snapshot of every
+scope granted to the session in trusted memory. The gateway then projects
+allowed kinds and properties, ranks lexical and optional vector seeds,
+performs bounded traversal, and returns provenance. This reduces model
+disclosure but is not yet repository-native targeted retrieval. Its canonical
+serialized byte limit covers the complete returned payload. Its token value is
+only a deterministic byte-based estimate; the host must apply the actual
+selected model tokenizer and final prompt budget. The adapter's `graph_id`
+labels that complete granted-scope view; it does not select private records.
 
 An external LLM necessarily sees those returned plaintext fields. Turning off
 "memory" does not cryptographically prove that a model provider kept no logs.
@@ -339,24 +405,27 @@ training policy, subprocessors, and required contracts such as a DPA or BAA
 when applicable. If zero sensitive plaintext may leave the trusted boundary,
 use a local/on-premises model or deterministic output.
 
-The prototype also exposes `get_vault_snapshot()` as a deliberate exception
-for the requested full-vault chatbot test. It is authenticated out of band and
-returns either one complete small vault or an error under fixed count and
-aggregate-ciphertext ceilings. It does not stream partial plaintext and
-AuthGraph does not cache its return value. Once returned, however, all
-decrypted entities and relationships are caller-owned plaintext; passing that
-snapshot to an LLM exposes the whole snapshot to the model environment. This
-high-exposure operation should not be offered as a model-selectable tool, and
-narrow task-specific retrieval remains the production recommendation.
+`get_vault_snapshot()` is the deliberate bounded full-authorized-scopes
+operation used internally by the current scoped adapter and available for
+small tests. It is authenticated out of band and returns either one complete
+small view or an error under fixed count and aggregate-ciphertext ceilings. It
+does not stream partial plaintext and AuthGraph does not cache its return
+value. Once returned, however, all decrypted entities and relationships are
+caller-owned plaintext; passing that snapshot directly to an LLM exposes the
+whole snapshot to the model environment. It must not be offered as a
+model-selectable tool. The current gateway filters the eventual model result,
+while future repository-native retrieval should also minimize plaintext inside
+the trusted process.
 Its all-or-nothing guarantee covers the rows visible to the scoped repository
 query and the configured bounds. It cannot detect a hostile storage actor that
 deletes a row or removes the label, vault metadata, or ownership edge needed
 to make that row query-visible; that requires an authenticated inventory
 outside the mutable graph.
 
-The current API has no update or delete operations. It also has no GraphRAG
-retriever, embedding provider, vector index, model tool executor, or AI write
-path.
+The current API has no update or delete operations, embedding model, encrypted
+embedding storage/loader, hosted model integration, or AI write path. The
+temporary vector index is caller-managed and must be closed before or with the
+secure session; automatic lifecycle binding is not implemented.
 
 ## Tests required before real data
 
@@ -383,7 +452,18 @@ The included unit tests cover the first layer:
 - atomic failure behavior for encrypted anchor/relationship bundles;
 - two-owner overlay isolation over one shared public graph;
 - policy-driven generic badges that reveal no private record count; and
-- fixed, graph-scoped public Neo4j query templates and malformed-row rejection.
+- fixed, graph-scoped public Neo4j query templates and malformed-row rejection;
+- independent v2 scope keys, wrong-scope denial, and relationship/endpoint
+  scope visibility;
+- fixed, owner-rooted, revision-fenced scoped Neo4j queries and strict
+  ciphertext decoding;
+- OTP attempt, expiry, resend, concurrency, evidence-forgery, and replay
+  behavior;
+- fixed scope profiles, provider release, authorization-epoch invalidation,
+  expiry-during-release, and provider-close ordering; and
+- GraphRAG kind/property filtering, bounded traversal, complete payload
+  budgets, provenance, vector intersection, and public/private merge
+  validation.
 
 Production also needs:
 
@@ -391,7 +471,7 @@ Production also needs:
   batch operation, and error path;
 - nonce uniqueness under concurrency, retries, and process failure;
 - session fixation, replay, cookie theft, CSRF, XSS, logout, and restart tests;
-- authorization and key-slot grant/revoke tests;
+- production KMS key-slot enrollment, grant, revoke, and rotation tests;
 - log, trace, analytics, crash report, and model-payload redaction assertions;
 - prompt-injection tests using malicious text stored in graph records;
 - backup/restore and key-loss drills;

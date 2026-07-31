@@ -28,6 +28,35 @@ CREATE INDEX authgraph_vault_owner IF NOT EXISTS
 FOR (vault:AGVault)
 ON (vault.principal_id);
 
+// Scoped-vault v2 keeps each private protection compartment under an
+// independently random key. Scope IDs are opaque; semantic names remain in
+// trusted application configuration. The v2 labels are separate so legacy
+// readers cannot accidentally reinterpret scoped ciphertext.
+
+CREATE CONSTRAINT authgraph_protection_scope_id IF NOT EXISTS
+FOR (scope:AGProtectionScope)
+REQUIRE scope.scope_id IS UNIQUE;
+
+CREATE CONSTRAINT authgraph_scoped_entity_id IF NOT EXISTS
+FOR (entity:AGScopedEntity)
+REQUIRE entity.entity_id IS UNIQUE;
+
+CREATE CONSTRAINT authgraph_scoped_relationship_id IF NOT EXISTS
+FOR ()-[link:AG_SCOPED_LINK]-()
+REQUIRE link.relationship_id IS UNIQUE;
+
+CREATE INDEX authgraph_protection_scope_vault IF NOT EXISTS
+FOR (scope:AGProtectionScope)
+ON (scope.vault_id);
+
+CREATE INDEX authgraph_scoped_entity_vault_scope IF NOT EXISTS
+FOR (entity:AGScopedEntity)
+ON (entity.vault_id, entity.scope_id);
+
+CREATE INDEX authgraph_scoped_relationship_vault_scope IF NOT EXISTS
+FOR ()-[link:AG_SCOPED_LINK]-()
+ON (link.vault_id, link.scope_id);
+
 // The layered graph API keeps intentionally public records in a physically
 // separate storage shape. Their semantic kinds and properties are plaintext
 // at AuthGraph's application-encryption layer. Never place confidential data

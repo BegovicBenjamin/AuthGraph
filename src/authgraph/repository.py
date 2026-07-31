@@ -10,12 +10,16 @@ from .models import (
     EncryptedRelationshipRow,
     EncryptedVaultSnapshotRow,
     KeyEnvelope,
+    ProtectionScopeRow,
+    ScopedEncryptedEntityRow,
+    ScopedEncryptedRelationshipRow,
+    ScopedEncryptedVaultSnapshotRow,
     VaultRow,
 )
 
 
-class GraphRepository(Protocol):
-    """Only fixed, vault-scoped operations are exposed—never arbitrary Cypher."""
+class VaultRepository(Protocol):
+    """Common versioned vault-envelope operations."""
 
     def create_vault(self, row: VaultRow) -> bool: ...
 
@@ -28,6 +32,10 @@ class GraphRepository(Protocol):
         expected_revision: int,
         envelope: KeyEnvelope,
     ) -> bool: ...
+
+
+class GraphRepository(VaultRepository, Protocol):
+    """Fixed legacy-v1 whole-vault operations; never arbitrary Cypher."""
 
     def put_entity(
         self,
@@ -85,5 +93,65 @@ class GraphRepository(Protocol):
         relationship_limit: int,
     ) -> EncryptedVaultSnapshotRow | None:
         """Fetch at most each limit plus one row to detect truncation."""
+
+        ...
+
+
+class ScopedGraphRepository(VaultRepository, Protocol):
+    """Fixed v2 protection-scope operations; never arbitrary Cypher."""
+
+    def put_protection_scope(
+        self,
+        principal_id: str,
+        vault_id: str,
+        envelope_revision: int,
+        row: ProtectionScopeRow,
+    ) -> bool: ...
+
+    def get_protection_scopes(
+        self,
+        principal_id: str,
+        vault_id: str,
+        envelope_revision: int,
+        scope_ids: tuple[str, ...],
+    ) -> tuple[ProtectionScopeRow, ...] | None: ...
+
+    def put_scoped_entity(
+        self,
+        principal_id: str,
+        vault_id: str,
+        envelope_revision: int,
+        row: ScopedEncryptedEntityRow,
+    ) -> bool: ...
+
+    def get_scoped_entity(
+        self,
+        principal_id: str,
+        vault_id: str,
+        envelope_revision: int,
+        allowed_scope_ids: tuple[str, ...],
+        entity_id: str,
+    ) -> ScopedEncryptedEntityRow | None: ...
+
+    def put_scoped_relationship(
+        self,
+        principal_id: str,
+        vault_id: str,
+        envelope_revision: int,
+        allowed_scope_ids: tuple[str, ...],
+        row: ScopedEncryptedRelationshipRow,
+    ) -> bool: ...
+
+    def get_scoped_vault_snapshot(
+        self,
+        principal_id: str,
+        vault_id: str,
+        envelope_revision: int,
+        allowed_scope_ids: tuple[str, ...],
+        *,
+        entity_limit: int,
+        relationship_limit: int,
+    ) -> ScopedEncryptedVaultSnapshotRow | None:
+        """Return ciphertext only from granted scopes, plus overflow sentinels."""
 
         ...

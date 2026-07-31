@@ -236,6 +236,30 @@ class CryptoEngine:
             raise
         return envelope, dek
 
+    def provision_scoped_vault(
+        self,
+        principal_id: str,
+        vault_id: str,
+        passphrase: bytes | bytearray | memoryview,
+    ) -> tuple[KeyEnvelope, bytearray]:
+        """Generate a v2 vault key used only to wrap independent scope DEKs."""
+
+        _validate_new_passphrase(passphrase)
+        vault_wrapping_key = bytearray(AESGCM.generate_key(bit_length=256))
+        try:
+            envelope = self.wrap_scoped_vault_key(
+                principal_id,
+                vault_id,
+                passphrase,
+                vault_wrapping_key,
+                envelope_revision=1,
+                key_version=1,
+            )
+        except Exception:
+            clear_bytearray(vault_wrapping_key)
+            raise
+        return envelope, vault_wrapping_key
+
     def wrap_dek(
         self,
         principal_id: str,
@@ -248,17 +272,62 @@ class CryptoEngine:
     ) -> KeyEnvelope:
         """Wrap an existing DEK, normally for initial setup or password change."""
 
+        return self._wrap_vault_key(
+            principal_id,
+            vault_id,
+            passphrase,
+            dek,
+            envelope_revision=envelope_revision,
+            key_version=key_version,
+            envelope_version=1,
+        )
+
+    def wrap_scoped_vault_key(
+        self,
+        principal_id: str,
+        vault_id: str,
+        passphrase: bytes | bytearray | memoryview,
+        vault_wrapping_key: bytes | bytearray | memoryview,
+        *,
+        envelope_revision: int,
+        key_version: int,
+    ) -> KeyEnvelope:
+        """Wrap a v2 vault key that is never used directly on graph records."""
+
+        return self._wrap_vault_key(
+            principal_id,
+            vault_id,
+            passphrase,
+            vault_wrapping_key,
+            envelope_revision=envelope_revision,
+            key_version=key_version,
+            envelope_version=2,
+        )
+
+    def _wrap_vault_key(
+        self,
+        principal_id: str,
+        vault_id: str,
+        passphrase: bytes | bytearray | memoryview,
+        vault_key: bytes | bytearray | memoryview,
+        *,
+        envelope_revision: int,
+        key_version: int,
+        envelope_version: int,
+    ) -> KeyEnvelope:
         _validate_new_passphrase(passphrase)
         if (
-            not isinstance(dek, (bytes, bytearray, memoryview))
-            or _buffer_size(dek) != AES_KEY_BYTES
+            not isinstance(vault_key, (bytes, bytearray, memoryview))
+            or _buffer_size(vault_key) != AES_KEY_BYTES
         ):
-            raise ValidationError("A vault DEK must be exactly 256 bits.")
+            raise ValidationError("A vault key must be exactly 256 bits.")
         if (
             type(envelope_revision) is not int
             or envelope_revision <= 0
             or type(key_version) is not int
             or key_version <= 0
+            or type(envelope_version) is not int
+            or envelope_version not in (1, 2)
         ):
             raise ValidationError("Vault key versions must be positive integers.")
         salt = os.urandom(SALT_BYTES)
@@ -267,11 +336,11 @@ class CryptoEngine:
         try:
             wrapped = AESGCM(kek).encrypt(
                 nonce,
-                dek,
+                vault_key,
                 self._envelope_aad(
                     principal_id,
                     vault_id,
-                    version=1,
+                    version=envelope_version,
                     envelope_revision=envelope_revision,
                     key_version=key_version,
                     wrapping_algorithm="AES-256-GCM",
@@ -282,7 +351,7 @@ class CryptoEngine:
         finally:
             clear_bytearray(kek)
         return KeyEnvelope(
-            version=1,
+            version=envelope_version,
             envelope_revision=envelope_revision,
             key_version=key_version,
             wrapping_algorithm="AES-256-GCM",
@@ -301,12 +370,46 @@ class CryptoEngine:
     ) -> bytearray:
         """Unlock a vault DEK or raise the same generic error for every failure."""
 
+        return self._unwrap_vault_key(
+            principal_id,
+            vault_id,
+            passphrase,
+            envelope,
+            expected_envelope_version=1,
+        )
+
+    def unwrap_scoped_vault_key(
+        self,
+        principal_id: str,
+        vault_id: str,
+        passphrase: bytes | bytearray | memoryview,
+        envelope: KeyEnvelope,
+    ) -> bytearray:
+        """Unlock a v2 vault key or return the same generic denial."""
+
+        return self._unwrap_vault_key(
+            principal_id,
+            vault_id,
+            passphrase,
+            envelope,
+            expected_envelope_version=2,
+        )
+
+    def _unwrap_vault_key(
+        self,
+        principal_id: str,
+        vault_id: str,
+        passphrase: bytes | bytearray | memoryview,
+        envelope: KeyEnvelope,
+        *,
+        expected_envelope_version: int,
+    ) -> bytearray:
         try:
             material = _passphrase_bytes(passphrase)
             if (
                 not isinstance(envelope, KeyEnvelope)
                 or type(envelope.version) is not int
-                or envelope.version != 1
+                or envelope.version != expected_envelope_version
                 or type(envelope.envelope_revision) is not int
                 or envelope.envelope_revision <= 0
                 or type(envelope.key_version) is not int
@@ -382,12 +485,15 @@ class CryptoEngine:
         *,
         aad_parts: tuple[object, ...],
         key_version: int = 1,
+        payload_version: int = 1,
     ) -> EncryptedPayload:
         if (
             not isinstance(dek, (bytes, bytearray, memoryview))
             or _buffer_size(dek) != AES_KEY_BYTES
             or type(key_version) is not int
             or key_version <= 0
+            or type(payload_version) is not int
+            or payload_version not in (1, 2)
         ):
             raise ValidationError("A vault DEK must be exactly 256 bits.")
         plaintext = bytearray(_canonical_json(value))
@@ -397,7 +503,7 @@ class CryptoEngine:
                 nonce,
                 plaintext,
                 CryptoEngine._payload_aad(
-                    version=1,
+                    version=payload_version,
                     key_version=key_version,
                     algorithm="AES-256-GCM",
                     aad_parts=aad_parts,
@@ -406,7 +512,7 @@ class CryptoEngine:
         finally:
             clear_bytearray(plaintext)
         return EncryptedPayload(
-            version=1,
+            version=payload_version,
             key_version=key_version,
             algorithm="AES-256-GCM",
             nonce=nonce,
@@ -419,13 +525,16 @@ class CryptoEngine:
         payload: EncryptedPayload,
         *,
         aad_parts: tuple[object, ...],
+        expected_payload_version: int = 1,
     ) -> dict[str, Any]:
         if (
             not isinstance(dek, (bytes, bytearray, memoryview))
             or _buffer_size(dek) != AES_KEY_BYTES
             or not isinstance(payload, EncryptedPayload)
             or type(payload.version) is not int
-            or payload.version != 1
+            or type(expected_payload_version) is not int
+            or expected_payload_version not in (1, 2)
+            or payload.version != expected_payload_version
             or type(payload.key_version) is not int
             or payload.key_version <= 0
             or not isinstance(payload.algorithm, str)
