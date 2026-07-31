@@ -1,5 +1,6 @@
 """AuthGraph public API."""
 
+from .authgraph import AuthGraph, GraphEntityRecord, GraphRelationshipRecord
 from .crypto import CryptoEngine
 from .errors import (
     AuthorizationDenied,
@@ -38,6 +39,15 @@ from .sessions import InMemorySessionBroker
 from .neo4j_repository import Neo4jGraphRepository
 from .neo4j_public_repository import Neo4jPublicGraphRepository
 from .neo4j_scoped_repository import Neo4jScopedGraphRepository
+from .neo4j_schema import (
+    Neo4jSchemaError,
+    SchemaApplyError,
+    SchemaProblem,
+    SchemaVerificationError,
+    SchemaVerificationReport,
+    apply_schema,
+    verify_schema,
+)
 from .otp import (
     InMemoryOneTimeCodeBroker,
     IssuedOneTimeCode,
@@ -78,8 +88,11 @@ from .unlock_policy import (
     UnlockProfile,
 )
 
+LegacyAuthGraphService = AuthGraphService
+
 __all__ = [
     "AccessContext",
+    "AuthGraph",
     "AuthorizationDenied",
     "AuthGraphError",
     "AuthGraphService",
@@ -89,8 +102,10 @@ __all__ = [
     "Entity",
     "EphemeralVectorIndex",
     "GraphEntityRef",
+    "GraphEntityRecord",
     "GraphPolicy",
     "GraphRelationshipRef",
+    "GraphRelationshipRecord",
     "InMemoryGraphRepository",
     "InMemoryOneTimeCodeBroker",
     "InMemoryPublicGraphRepository",
@@ -104,10 +119,12 @@ __all__ = [
     "LayeredGraphView",
     "LayeredGraphViewProvider",
     "LayeredRelationship",
+    "LegacyAuthGraphService",
     "LockedDisclosure",
     "Neighborhood",
     "Neo4jGraphRepository",
     "Neo4jPublicGraphRepository",
+    "Neo4jSchemaError",
     "Neo4jScopedGraphRepository",
     "OneTimeCodeDenied",
     "OneTimeCodeError",
@@ -130,6 +147,10 @@ __all__ = [
     "ScopeKeyMaterial",
     "ScopeKeyReleaseProvider",
     "ScopeUnlockGrant",
+    "SchemaApplyError",
+    "SchemaProblem",
+    "SchemaVerificationError",
+    "SchemaVerificationReport",
     "ScopedAuthGraphService",
     "ScopedEntity",
     "ScopedGraphViewAdapter",
@@ -144,4 +165,6 @@ __all__ = [
     "VectorMatch",
     "VaultSnapshot",
     "UnlockProfile",
+    "apply_schema",
+    "verify_schema",
 ]

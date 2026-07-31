@@ -229,9 +229,10 @@ References:
 The decrypted graph is a virtual view in trusted memory. It is never written
 back to Neo4j as plaintext.
 
-`ScopedGraphViewAdapter` requests a bounded complete snapshot of only the
-scopes present in the current v2 session and decrypts it in trusted memory.
-`SessionVisibleGraphGateway` then combines:
+The main `AuthGraph` facade requests a bounded complete snapshot of only the
+scopes present in the current v2 session, decrypts it in trusted memory, and
+selects the requested encrypted logical graph. `SessionVisibleGraphGateway`
+then combines:
 
 ```text
 allowed public records
@@ -397,7 +398,8 @@ A safe write flow is:
 5. AuthGraph encrypts the node or connection before Neo4j receives it.
 6. An audit event records opaque IDs and the action, never the secret content.
 
-Updates, deletes, classification changes, and AI write tools are not currently
+Revision-checked private updates and restrictive deletes exist as trusted
+backend operations. Classification changes and AI write tools are not
 implemented.
 
 ## Internal model
@@ -443,9 +445,11 @@ shared durable revision and revocation state.
 
 ## What is next
 
-The first vertical slice now includes real scope keys, fixed scoped Neo4j
-queries, password and OTP-authorized sessions, disclosure policies, bounded
-retrieval, provenance, and a temporary vector helper.
+The first vertical slice now includes real scope keys, a single v2
+public/private facade, fixed scoped Neo4j queries, private CRUD and idempotent
+creates, packaged schema checks, password and OTP-authorized sessions,
+disclosure policies, bounded retrieval, provenance, and a temporary vector
+helper.
 
 The next work is:
 
@@ -453,10 +457,10 @@ The next work is:
 2. Add a production KMS/HSM scope-key provider and real passkey/IdP adapters.
 3. Add the host HTTP security layer, delivery adapter, rate limits, and audit
    events.
-4. Store embeddings encrypted per scope and automatically destroy temporary
-   indexes with their sessions.
-5. Add migration, key rotation, recovery, update/delete, multi-process
-   revocation, and external anti-rollback state.
+4. Add repository-native bounded retrieval, store embeddings encrypted per
+   scope, and automatically destroy temporary indexes with their sessions.
+5. Add public CRUD/idempotency, atomic batches, migration, key rotation,
+   recovery, multi-process revocation, and external anti-rollback state.
 6. Perform independent security and privacy review.
 
 Until that work is complete, AuthGraph remains a synthetic-data prototype

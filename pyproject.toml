@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "authgraph"
-version = "0.1.0"
-description = "An owner-scoped encrypted knowledge graph security layer for Neo4j"
+version = "0.2.0"
+description = "A scoped encrypted public/private knowledge graph layer for Neo4j"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
@@ -17,5 +17,11 @@ dependencies = [
   "neo4j>=6.2,<7",
 ]
 
+[project.scripts]
+authgraph = "authgraph.cli:main"
+
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"authgraph.neo4j" = ["schema.cypher"]

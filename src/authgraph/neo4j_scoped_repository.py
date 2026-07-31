@@ -199,6 +199,7 @@ class Neo4jScopedGraphRepository(Neo4jGraphRepository):
         vault_id: $vault_id,
         scope_id: $scope_id,
         entity_id: $entity_id,
+        record_revision: $record_revision,
         payload_version: $payload_version,
         key_version: $key_version,
         algorithm: $algorithm,
@@ -229,6 +230,7 @@ class Neo4jScopedGraphRepository(Neo4jGraphRepository):
         entity.vault_id AS vault_id,
         entity.scope_id AS scope_id,
         entity.entity_id AS entity_id,
+        coalesce(entity.record_revision, 1) AS record_revision,
         scope.scope_key_version AS protection_scope_key_version,
         entity.payload_version AS payload_version,
         entity.key_version AS key_version,
@@ -287,6 +289,7 @@ class Neo4jScopedGraphRepository(Neo4jGraphRepository):
         vault_id: $vault_id,
         scope_id: $scope_id,
         relationship_id: $relationship_id,
+        record_revision: $record_revision,
         payload_version: $payload_version,
         key_version: $key_version,
         algorithm: $algorithm,
@@ -294,6 +297,137 @@ class Neo4jScopedGraphRepository(Neo4jGraphRepository):
         ciphertext: $ciphertext
     }]->(target)
     RETURN count(link) AS created
+    """
+
+    _PUT_SCOPED_ENTITY_RELATIONSHIP_BUNDLE = """
+    MATCH (vault:AGVault {
+        vault_id: $vault_id,
+        principal_id: $principal_id,
+        envelope_version: 2
+    })
+    SET vault._authgraph_lock = true
+    REMOVE vault._authgraph_lock
+    WITH vault
+    WHERE vault.envelope_revision = $envelope_revision
+    MATCH (vault)-[:AG_HAS_SCOPE]->(
+        relationship_scope:AGProtectionScope {
+            vault_id: $vault_id,
+            scope_id: $scope_id
+        }
+    )
+    WHERE
+        relationship_scope.scope_id IN $allowed_scope_ids
+        AND relationship_scope.root_key_version = vault.key_version
+        AND relationship_scope.scope_key_version
+            = $relationship_key_version
+        AND $relationship_record_revision = 1
+        AND all(candidate IN $entity_rows WHERE
+            candidate.scope_id = relationship_scope.scope_id
+            AND candidate.key_version
+                = relationship_scope.scope_key_version
+            AND candidate.record_revision = 1
+            AND NOT EXISTS {
+                MATCH (:AGScopedEntity {
+                    entity_id: candidate.entity_id
+                })
+            }
+        )
+        AND NOT EXISTS {
+            MATCH ()-[existing:AG_SCOPED_LINK {
+                relationship_id: $relationship_id
+            }]->()
+        }
+        AND (
+            $from_entity_id IN [
+                candidate IN $entity_rows | candidate.entity_id
+            ]
+            OR EXISTS {
+                MATCH (vault)-[:AG_HAS_SCOPE]->(
+                    existing_source_scope:AGProtectionScope {
+                        vault_id: $vault_id
+                    }
+                )-[:AG_PROTECTS]->(existing_source:AGScopedEntity {
+                    vault_id: $vault_id,
+                    entity_id: $from_entity_id
+                })
+                WHERE
+                    existing_source_scope.scope_id IN $allowed_scope_ids
+                    AND existing_source_scope.root_key_version
+                        = vault.key_version
+                    AND existing_source.scope_id
+                        = existing_source_scope.scope_id
+            }
+        )
+        AND (
+            $to_entity_id IN [
+                candidate IN $entity_rows | candidate.entity_id
+            ]
+            OR EXISTS {
+                MATCH (vault)-[:AG_HAS_SCOPE]->(
+                    existing_target_scope:AGProtectionScope {
+                        vault_id: $vault_id
+                    }
+                )-[:AG_PROTECTS]->(existing_target:AGScopedEntity {
+                    vault_id: $vault_id,
+                    entity_id: $to_entity_id
+                })
+                WHERE
+                    existing_target_scope.scope_id IN $allowed_scope_ids
+                    AND existing_target_scope.root_key_version
+                        = vault.key_version
+                    AND existing_target.scope_id
+                        = existing_target_scope.scope_id
+            }
+        )
+    FOREACH (candidate IN $entity_rows |
+        CREATE (entity:AGScopedEntity {
+            vault_id: $vault_id,
+            scope_id: candidate.scope_id,
+            entity_id: candidate.entity_id,
+            record_revision: candidate.record_revision,
+            payload_version: candidate.payload_version,
+            key_version: candidate.key_version,
+            algorithm: candidate.algorithm,
+            nonce: candidate.nonce,
+            ciphertext: candidate.ciphertext
+        })
+        CREATE (relationship_scope)-[:AG_PROTECTS]->(entity)
+    )
+    WITH vault, relationship_scope
+    MATCH (vault)-[:AG_HAS_SCOPE]->(source_scope:AGProtectionScope {
+        vault_id: $vault_id
+    })-[:AG_PROTECTS]->(source:AGScopedEntity {
+        vault_id: $vault_id,
+        entity_id: $from_entity_id
+    })
+    WHERE
+        source_scope.scope_id IN $allowed_scope_ids
+        AND source_scope.root_key_version = vault.key_version
+        AND source.scope_id = source_scope.scope_id
+    MATCH (vault)-[:AG_HAS_SCOPE]->(target_scope:AGProtectionScope {
+        vault_id: $vault_id
+    })-[:AG_PROTECTS]->(target:AGScopedEntity {
+        vault_id: $vault_id,
+        entity_id: $to_entity_id
+    })
+    WHERE
+        target_scope.scope_id IN $allowed_scope_ids
+        AND target_scope.root_key_version = vault.key_version
+        AND target.scope_id = target_scope.scope_id
+    CREATE (source)-[link:AG_SCOPED_LINK {
+        vault_id: $vault_id,
+        scope_id: $scope_id,
+        relationship_id: $relationship_id,
+        record_revision: $relationship_record_revision,
+        payload_version: $relationship_payload_version,
+        key_version: $relationship_key_version,
+        algorithm: $relationship_algorithm,
+        nonce: $relationship_nonce,
+        ciphertext: $relationship_ciphertext
+    }]->(target)
+    RETURN
+        size($entity_rows) AS created_entities,
+        count(link) AS created_relationships
     """
 
     _GET_SCOPED_RELATIONSHIP = """
@@ -305,6 +439,96 @@ class Neo4jScopedGraphRepository(Neo4jGraphRepository):
     })-[:AG_HAS_SCOPE]->(
         relationship_scope:AGProtectionScope {
             vault_id: $vault_id
+        }
+    )
+    MATCH (vault)-[:AG_HAS_SCOPE]->(source_scope:AGProtectionScope {
+        vault_id: $vault_id
+    })-[:AG_PROTECTS]->(source:AGScopedEntity {vault_id: $vault_id})
+    MATCH (vault)-[:AG_HAS_SCOPE]->(target_scope:AGProtectionScope {
+        vault_id: $vault_id
+    })-[:AG_PROTECTS]->(target:AGScopedEntity {vault_id: $vault_id})
+    MATCH (source)-[link:AG_SCOPED_LINK {
+        vault_id: $vault_id,
+        relationship_id: $relationship_id
+    }]->(target)
+    WHERE
+        relationship_scope.scope_id = link.scope_id
+        AND relationship_scope.scope_id IN $allowed_scope_ids
+        AND relationship_scope.root_key_version = vault.key_version
+        AND source_scope.scope_id IN $allowed_scope_ids
+        AND source_scope.root_key_version = vault.key_version
+        AND target_scope.scope_id IN $allowed_scope_ids
+        AND target_scope.root_key_version = vault.key_version
+        AND source.scope_id = source_scope.scope_id
+        AND target.scope_id = target_scope.scope_id
+    RETURN
+        link.vault_id AS vault_id,
+        link.scope_id AS scope_id,
+        link.relationship_id AS relationship_id,
+        coalesce(link.record_revision, 1) AS record_revision,
+        source.entity_id AS from_entity_id,
+        source_scope.scope_id AS from_scope_id,
+        target.entity_id AS to_entity_id,
+        target_scope.scope_id AS to_scope_id,
+        relationship_scope.scope_key_version
+            AS protection_scope_key_version,
+        link.payload_version AS payload_version,
+        link.key_version AS key_version,
+        link.algorithm AS algorithm,
+        link.nonce AS nonce,
+        link.ciphertext AS ciphertext
+    LIMIT 1
+    """
+
+    _REPLACE_SCOPED_ENTITY = """
+    MATCH (vault:AGVault {
+        vault_id: $vault_id,
+        principal_id: $principal_id,
+        envelope_version: 2
+    })
+    SET vault._authgraph_lock = true
+    REMOVE vault._authgraph_lock
+    WITH vault
+    WHERE vault.envelope_revision = $envelope_revision
+    MATCH (vault)-[:AG_HAS_SCOPE]->(scope:AGProtectionScope {
+        vault_id: $vault_id,
+        scope_id: $scope_id
+    })-[:AG_PROTECTS]->(entity:AGScopedEntity {
+        vault_id: $vault_id,
+        entity_id: $entity_id
+    })
+    WHERE
+        scope.scope_id IN $allowed_scope_ids
+        AND scope.root_key_version = vault.key_version
+        AND scope.scope_key_version = $key_version
+        AND entity.scope_id = scope.scope_id
+        AND coalesce(entity.record_revision, 1)
+            = $expected_record_revision
+        AND $record_revision = $expected_record_revision + 1
+    SET
+        entity.record_revision = $record_revision,
+        entity.payload_version = $payload_version,
+        entity.key_version = $key_version,
+        entity.algorithm = $algorithm,
+        entity.nonce = $nonce,
+        entity.ciphertext = $ciphertext
+    RETURN count(entity) AS updated
+    """
+
+    _REPLACE_SCOPED_RELATIONSHIP = """
+    MATCH (vault:AGVault {
+        vault_id: $vault_id,
+        principal_id: $principal_id,
+        envelope_version: 2
+    })
+    SET vault._authgraph_lock = true
+    REMOVE vault._authgraph_lock
+    WITH vault
+    WHERE vault.envelope_revision = $envelope_revision
+    MATCH (vault)-[:AG_HAS_SCOPE]->(
+        relationship_scope:AGProtectionScope {
+            vault_id: $vault_id,
+            scope_id: $scope_id
         }
     )
     MATCH (vault)-[:AG_HAS_SCOPE]->(source_scope:AGProtectionScope {
@@ -327,28 +551,92 @@ class Neo4jScopedGraphRepository(Neo4jGraphRepository):
         relationship_scope.scope_id = link.scope_id
         AND relationship_scope.scope_id IN $allowed_scope_ids
         AND relationship_scope.root_key_version = vault.key_version
+        AND relationship_scope.scope_key_version = $key_version
         AND source_scope.scope_id IN $allowed_scope_ids
         AND source_scope.root_key_version = vault.key_version
         AND target_scope.scope_id IN $allowed_scope_ids
         AND target_scope.root_key_version = vault.key_version
         AND source.scope_id = source_scope.scope_id
         AND target.scope_id = target_scope.scope_id
-    RETURN
-        link.vault_id AS vault_id,
-        link.scope_id AS scope_id,
-        link.relationship_id AS relationship_id,
-        source.entity_id AS from_entity_id,
-        source_scope.scope_id AS from_scope_id,
-        target.entity_id AS to_entity_id,
-        target_scope.scope_id AS to_scope_id,
-        relationship_scope.scope_key_version
-            AS protection_scope_key_version,
-        link.payload_version AS payload_version,
-        link.key_version AS key_version,
-        link.algorithm AS algorithm,
-        link.nonce AS nonce,
-        link.ciphertext AS ciphertext
-    LIMIT 1
+        AND coalesce(link.record_revision, 1)
+            = $expected_record_revision
+        AND $record_revision = $expected_record_revision + 1
+    SET
+        link.record_revision = $record_revision,
+        link.payload_version = $payload_version,
+        link.key_version = $key_version,
+        link.algorithm = $algorithm,
+        link.nonce = $nonce,
+        link.ciphertext = $ciphertext
+    RETURN count(link) AS updated
+    """
+
+    _DELETE_SCOPED_ENTITY = """
+    MATCH (vault:AGVault {
+        vault_id: $vault_id,
+        principal_id: $principal_id,
+        envelope_version: 2
+    })
+    SET vault._authgraph_lock = true
+    REMOVE vault._authgraph_lock
+    WITH vault
+    WHERE vault.envelope_revision = $envelope_revision
+    MATCH (vault)-[:AG_HAS_SCOPE]->(scope:AGProtectionScope {
+        vault_id: $vault_id
+    })-[protects:AG_PROTECTS]->(entity:AGScopedEntity {
+        vault_id: $vault_id,
+        entity_id: $entity_id
+    })
+    WHERE
+        scope.scope_id IN $allowed_scope_ids
+        AND scope.root_key_version = vault.key_version
+        AND entity.scope_id = scope.scope_id
+        AND coalesce(entity.record_revision, 1)
+            = $expected_record_revision
+        AND NOT EXISTS {
+            MATCH (entity)-[:AG_SCOPED_LINK]-()
+        }
+    DELETE protects, entity
+    RETURN 1 AS deleted
+    """
+
+    _DELETE_SCOPED_RELATIONSHIP = """
+    MATCH (vault:AGVault {
+        vault_id: $vault_id,
+        principal_id: $principal_id,
+        envelope_version: 2
+    })
+    SET vault._authgraph_lock = true
+    REMOVE vault._authgraph_lock
+    WITH vault
+    WHERE vault.envelope_revision = $envelope_revision
+    MATCH (vault)-[:AG_HAS_SCOPE]->(
+        relationship_scope:AGProtectionScope {vault_id: $vault_id}
+    )
+    MATCH (vault)-[:AG_HAS_SCOPE]->(source_scope:AGProtectionScope {
+        vault_id: $vault_id
+    })-[:AG_PROTECTS]->(source:AGScopedEntity {vault_id: $vault_id})
+    MATCH (vault)-[:AG_HAS_SCOPE]->(target_scope:AGProtectionScope {
+        vault_id: $vault_id
+    })-[:AG_PROTECTS]->(target:AGScopedEntity {vault_id: $vault_id})
+    MATCH (source)-[link:AG_SCOPED_LINK {
+        vault_id: $vault_id,
+        relationship_id: $relationship_id
+    }]->(target)
+    WHERE
+        relationship_scope.scope_id = link.scope_id
+        AND relationship_scope.scope_id IN $allowed_scope_ids
+        AND relationship_scope.root_key_version = vault.key_version
+        AND source_scope.scope_id IN $allowed_scope_ids
+        AND source_scope.root_key_version = vault.key_version
+        AND target_scope.scope_id IN $allowed_scope_ids
+        AND target_scope.root_key_version = vault.key_version
+        AND source.scope_id = source_scope.scope_id
+        AND target.scope_id = target_scope.scope_id
+        AND coalesce(link.record_revision, 1)
+            = $expected_record_revision
+    DELETE link
+    RETURN 1 AS deleted
     """
 
     _GET_SCOPED_VAULT_SNAPSHOT = """
@@ -379,6 +667,7 @@ class Neo4jScopedGraphRepository(Neo4jGraphRepository):
                 vault_id: entity.vault_id,
                 scope_id: entity.scope_id,
                 entity_id: entity.entity_id,
+                record_revision: coalesce(entity.record_revision, 1),
                 protection_scope_key_version: scope.scope_key_version,
                 payload_version: entity.payload_version,
                 key_version: entity.key_version,
@@ -429,6 +718,7 @@ class Neo4jScopedGraphRepository(Neo4jGraphRepository):
                 vault_id: link.vault_id,
                 scope_id: link.scope_id,
                 relationship_id: link.relationship_id,
+                record_revision: coalesce(link.record_revision, 1),
                 from_entity_id: source.entity_id,
                 from_scope_id: source_scope.scope_id,
                 to_entity_id: target.entity_id,
@@ -519,6 +809,22 @@ class Neo4jScopedGraphRepository(Neo4jGraphRepository):
             and len(payload.ciphertext) >= AES_GCM_TAG_BYTES
         )
 
+    @staticmethod
+    def _valid_record_revision(value: object) -> bool:
+        return type(value) is int and value > 0
+
+    @staticmethod
+    def _record_revision(record: Any) -> int:
+        """Decode a revision, treating pre-CRUD rows as revision one."""
+
+        try:
+            value = record["record_revision"]
+        except (KeyError, TypeError, IndexError):
+            value = 1
+        if not Neo4jScopedGraphRepository._valid_record_revision(value):
+            raise IntegrityViolation()
+        return value
+
     def _scope_from_record(self, record: Any) -> ProtectionScopeRow:
         envelope = ScopeKeyEnvelope(
             version=self._record_integer(record, "scope_envelope_version"),
@@ -567,6 +873,7 @@ class Neo4jScopedGraphRepository(Neo4jGraphRepository):
             scope_id=self._opaque_text(record, "scope_id"),
             entity_id=self._opaque_text(record, "entity_id"),
             payload=payload,
+            record_revision=self._record_revision(record),
         )
 
     def _scoped_relationship_from_record(
@@ -590,6 +897,7 @@ class Neo4jScopedGraphRepository(Neo4jGraphRepository):
             from_entity_id=self._opaque_text(record, "from_entity_id"),
             to_entity_id=self._opaque_text(record, "to_entity_id"),
             payload=payload,
+            record_revision=self._record_revision(record),
         )
         return (
             row,
@@ -730,6 +1038,7 @@ class Neo4jScopedGraphRepository(Neo4jGraphRepository):
             or row.vault_id != vault_id
             or not self._valid_scope_ids((row.scope_id,))
             or not self._valid_scoped_payload(row.payload)
+            or row.record_revision != 1
         ):
             return False
         try:
@@ -741,6 +1050,7 @@ class Neo4jScopedGraphRepository(Neo4jGraphRepository):
                     envelope_revision=envelope_revision,
                     scope_id=row.scope_id,
                     entity_id=row.entity_id,
+                    record_revision=row.record_revision,
                     **self._payload_parameters(row.payload),
                 )
             )
@@ -813,6 +1123,7 @@ class Neo4jScopedGraphRepository(Neo4jGraphRepository):
             or not self._valid_scope_ids(allowed_scope_ids)
             or row.scope_id not in allowed_scope_ids
             or not self._valid_scoped_payload(row.payload)
+            or row.record_revision != 1
         ):
             return False
         parameters = {
@@ -824,6 +1135,7 @@ class Neo4jScopedGraphRepository(Neo4jGraphRepository):
             "relationship_id": row.relationship_id,
             "from_entity_id": row.from_entity_id,
             "to_entity_id": row.to_entity_id,
+            "record_revision": row.record_revision,
             **self._payload_parameters(row.payload),
         }
         try:
@@ -834,14 +1146,12 @@ class Neo4jScopedGraphRepository(Neo4jGraphRepository):
                 )
             )
         except IncompleteCommit:
-            existing = self._get_scoped_relationship(
+            existing = self.get_scoped_relationship(
                 principal_id,
                 vault_id,
                 envelope_revision,
                 allowed_scope_ids,
                 row.relationship_id,
-                row.from_entity_id,
-                row.to_entity_id,
             )
             if existing == row:
                 return True
@@ -849,27 +1159,172 @@ class Neo4jScopedGraphRepository(Neo4jGraphRepository):
         if first is not None and self._record_integer(first, "created") == 1:
             return True
         return (
-            self._get_scoped_relationship(
+            self.get_scoped_relationship(
                 principal_id,
                 vault_id,
                 envelope_revision,
                 allowed_scope_ids,
                 row.relationship_id,
-                row.from_entity_id,
-                row.to_entity_id,
             )
             == row
         )
 
-    def _get_scoped_relationship(
+    def put_scoped_entity_relationship_bundle(
+        self,
+        principal_id: str,
+        vault_id: str,
+        envelope_revision: int,
+        allowed_scope_ids: tuple[str, ...],
+        entity_rows: tuple[ScopedEncryptedEntityRow, ...],
+        relationship_row: ScopedEncryptedRelationshipRow,
+    ) -> bool:
+        if (
+            not isinstance(entity_rows, tuple)
+            or any(
+                not isinstance(row, ScopedEncryptedEntityRow)
+                for row in entity_rows
+            )
+            or not isinstance(
+                relationship_row,
+                ScopedEncryptedRelationshipRow,
+            )
+        ):
+            return False
+        entity_ids = tuple(row.entity_id for row in entity_rows)
+        endpoint_ids = {
+            relationship_row.from_entity_id,
+            relationship_row.to_entity_id,
+        }
+        if (
+            not self._valid_scope_ids(allowed_scope_ids)
+            or not 1 <= len(entity_rows) <= 2
+            or len(entity_ids) != len(set(entity_ids))
+            or not set(entity_ids).issubset(endpoint_ids)
+            or relationship_row.vault_id != vault_id
+            or relationship_row.scope_id not in allowed_scope_ids
+            or relationship_row.record_revision != 1
+            or not self._valid_scoped_payload(relationship_row.payload)
+            or any(
+                not isinstance(row, ScopedEncryptedEntityRow)
+                or row.vault_id != vault_id
+                or row.scope_id != relationship_row.scope_id
+                or row.record_revision != 1
+                or not self._valid_scoped_payload(row.payload)
+                or row.payload.key_version
+                != relationship_row.payload.key_version
+                for row in entity_rows
+            )
+        ):
+            return False
+
+        entity_parameters = [
+            {
+                "scope_id": row.scope_id,
+                "entity_id": row.entity_id,
+                "record_revision": row.record_revision,
+                **self._payload_parameters(row.payload),
+            }
+            for row in entity_rows
+        ]
+        relationship_payload = self._payload_parameters(
+            relationship_row.payload
+        )
+        parameters = {
+            "principal_id": principal_id,
+            "vault_id": vault_id,
+            "envelope_revision": envelope_revision,
+            "allowed_scope_ids": list(allowed_scope_ids),
+            "scope_id": relationship_row.scope_id,
+            "entity_rows": entity_parameters,
+            "relationship_id": relationship_row.relationship_id,
+            "from_entity_id": relationship_row.from_entity_id,
+            "to_entity_id": relationship_row.to_entity_id,
+            "relationship_record_revision": (
+                relationship_row.record_revision
+            ),
+            "relationship_payload_version": relationship_payload[
+                "payload_version"
+            ],
+            "relationship_key_version": relationship_payload[
+                "key_version"
+            ],
+            "relationship_algorithm": relationship_payload["algorithm"],
+            "relationship_nonce": relationship_payload["nonce"],
+            "relationship_ciphertext": relationship_payload["ciphertext"],
+        }
+        try:
+            first = self._first(
+                self._execute(
+                    self._PUT_SCOPED_ENTITY_RELATIONSHIP_BUNDLE,
+                    **parameters,
+                )
+            )
+        except IncompleteCommit:
+            if self._scoped_bundle_is_exact(
+                principal_id,
+                vault_id,
+                envelope_revision,
+                allowed_scope_ids,
+                entity_rows,
+                relationship_row,
+            ):
+                return True
+            raise
+        if (
+            first is not None
+            and self._record_integer(first, "created_entities")
+            == len(entity_rows)
+            and self._record_integer(first, "created_relationships") == 1
+        ):
+            return True
+        return self._scoped_bundle_is_exact(
+            principal_id,
+            vault_id,
+            envelope_revision,
+            allowed_scope_ids,
+            entity_rows,
+            relationship_row,
+        )
+
+    def _scoped_bundle_is_exact(
+        self,
+        principal_id: str,
+        vault_id: str,
+        envelope_revision: int,
+        allowed_scope_ids: tuple[str, ...],
+        entity_rows: tuple[ScopedEncryptedEntityRow, ...],
+        relationship_row: ScopedEncryptedRelationshipRow,
+    ) -> bool:
+        for row in entity_rows:
+            if (
+                self.get_scoped_entity(
+                    principal_id,
+                    vault_id,
+                    envelope_revision,
+                    allowed_scope_ids,
+                    row.entity_id,
+                )
+                != row
+            ):
+                return False
+        return (
+            self.get_scoped_relationship(
+                principal_id,
+                vault_id,
+                envelope_revision,
+                allowed_scope_ids,
+                relationship_row.relationship_id,
+            )
+            == relationship_row
+        )
+
+    def get_scoped_relationship(
         self,
         principal_id: str,
         vault_id: str,
         envelope_revision: int,
         allowed_scope_ids: tuple[str, ...],
         relationship_id: str,
-        from_entity_id: str,
-        to_entity_id: str,
     ) -> ScopedEncryptedRelationshipRow | None:
         if not self._valid_scope_ids(allowed_scope_ids):
             return None
@@ -881,8 +1336,6 @@ class Neo4jScopedGraphRepository(Neo4jGraphRepository):
                 envelope_revision=envelope_revision,
                 allowed_scope_ids=list(allowed_scope_ids),
                 relationship_id=relationship_id,
-                from_entity_id=from_entity_id,
-                to_entity_id=to_entity_id,
             )
         )
         if first is None:
@@ -893,14 +1346,224 @@ class Neo4jScopedGraphRepository(Neo4jGraphRepository):
         if (
             row.vault_id != vault_id
             or row.relationship_id != relationship_id
-            or row.from_entity_id != from_entity_id
-            or row.to_entity_id != to_entity_id
             or row.scope_id not in allowed_scope_ids
             or from_scope_id not in allowed_scope_ids
             or to_scope_id not in allowed_scope_ids
         ):
             raise IntegrityViolation()
         return row
+
+    def replace_scoped_entity(
+        self,
+        principal_id: str,
+        vault_id: str,
+        envelope_revision: int,
+        allowed_scope_ids: tuple[str, ...],
+        expected_record_revision: int,
+        row: ScopedEncryptedEntityRow,
+    ) -> bool:
+        if (
+            not isinstance(row, ScopedEncryptedEntityRow)
+            or row.vault_id != vault_id
+            or not self._valid_scope_ids(allowed_scope_ids)
+            or row.scope_id not in allowed_scope_ids
+            or not self._valid_scoped_payload(row.payload)
+            or not self._valid_record_revision(expected_record_revision)
+            or row.record_revision != expected_record_revision + 1
+        ):
+            return False
+        parameters = {
+            "principal_id": principal_id,
+            "vault_id": vault_id,
+            "envelope_revision": envelope_revision,
+            "allowed_scope_ids": list(allowed_scope_ids),
+            "expected_record_revision": expected_record_revision,
+            "record_revision": row.record_revision,
+            "scope_id": row.scope_id,
+            "entity_id": row.entity_id,
+            **self._payload_parameters(row.payload),
+        }
+        try:
+            first = self._first(
+                self._execute(self._REPLACE_SCOPED_ENTITY, **parameters)
+            )
+        except IncompleteCommit:
+            existing = self.get_scoped_entity(
+                principal_id,
+                vault_id,
+                envelope_revision,
+                allowed_scope_ids,
+                row.entity_id,
+            )
+            if existing == row:
+                return True
+            raise
+        if first is not None and self._record_integer(first, "updated") == 1:
+            return True
+        return (
+            self.get_scoped_entity(
+                principal_id,
+                vault_id,
+                envelope_revision,
+                allowed_scope_ids,
+                row.entity_id,
+            )
+            == row
+        )
+
+    def replace_scoped_relationship(
+        self,
+        principal_id: str,
+        vault_id: str,
+        envelope_revision: int,
+        allowed_scope_ids: tuple[str, ...],
+        expected_record_revision: int,
+        row: ScopedEncryptedRelationshipRow,
+    ) -> bool:
+        if (
+            not isinstance(row, ScopedEncryptedRelationshipRow)
+            or row.vault_id != vault_id
+            or not self._valid_scope_ids(allowed_scope_ids)
+            or row.scope_id not in allowed_scope_ids
+            or not self._valid_scoped_payload(row.payload)
+            or not self._valid_record_revision(expected_record_revision)
+            or row.record_revision != expected_record_revision + 1
+        ):
+            return False
+        parameters = {
+            "principal_id": principal_id,
+            "vault_id": vault_id,
+            "envelope_revision": envelope_revision,
+            "allowed_scope_ids": list(allowed_scope_ids),
+            "expected_record_revision": expected_record_revision,
+            "record_revision": row.record_revision,
+            "scope_id": row.scope_id,
+            "relationship_id": row.relationship_id,
+            "from_entity_id": row.from_entity_id,
+            "to_entity_id": row.to_entity_id,
+            **self._payload_parameters(row.payload),
+        }
+        try:
+            first = self._first(
+                self._execute(
+                    self._REPLACE_SCOPED_RELATIONSHIP,
+                    **parameters,
+                )
+            )
+        except IncompleteCommit:
+            existing = self.get_scoped_relationship(
+                principal_id,
+                vault_id,
+                envelope_revision,
+                allowed_scope_ids,
+                row.relationship_id,
+            )
+            if existing == row:
+                return True
+            raise
+        if first is not None and self._record_integer(first, "updated") == 1:
+            return True
+        return (
+            self.get_scoped_relationship(
+                principal_id,
+                vault_id,
+                envelope_revision,
+                allowed_scope_ids,
+                row.relationship_id,
+            )
+            == row
+        )
+
+    def delete_scoped_entity(
+        self,
+        principal_id: str,
+        vault_id: str,
+        envelope_revision: int,
+        allowed_scope_ids: tuple[str, ...],
+        entity_id: str,
+        expected_record_revision: int,
+    ) -> bool:
+        if (
+            not self._valid_scope_ids(allowed_scope_ids)
+            or not self._valid_record_revision(expected_record_revision)
+        ):
+            return False
+        parameters = {
+            "principal_id": principal_id,
+            "vault_id": vault_id,
+            "envelope_revision": envelope_revision,
+            "allowed_scope_ids": list(allowed_scope_ids),
+            "entity_id": entity_id,
+            "expected_record_revision": expected_record_revision,
+        }
+        try:
+            first = self._first(
+                self._execute(self._DELETE_SCOPED_ENTITY, **parameters)
+            )
+        except IncompleteCommit:
+            if (
+                self.get_scoped_entity(
+                    principal_id,
+                    vault_id,
+                    envelope_revision,
+                    allowed_scope_ids,
+                    entity_id,
+                )
+                is None
+            ):
+                return True
+            raise
+        return (
+            first is not None
+            and self._record_integer(first, "deleted") == 1
+        )
+
+    def delete_scoped_relationship(
+        self,
+        principal_id: str,
+        vault_id: str,
+        envelope_revision: int,
+        allowed_scope_ids: tuple[str, ...],
+        relationship_id: str,
+        expected_record_revision: int,
+    ) -> bool:
+        if (
+            not self._valid_scope_ids(allowed_scope_ids)
+            or not self._valid_record_revision(expected_record_revision)
+        ):
+            return False
+        parameters = {
+            "principal_id": principal_id,
+            "vault_id": vault_id,
+            "envelope_revision": envelope_revision,
+            "allowed_scope_ids": list(allowed_scope_ids),
+            "relationship_id": relationship_id,
+            "expected_record_revision": expected_record_revision,
+        }
+        try:
+            first = self._first(
+                self._execute(
+                    self._DELETE_SCOPED_RELATIONSHIP,
+                    **parameters,
+                )
+            )
+        except IncompleteCommit:
+            if (
+                self.get_scoped_relationship(
+                    principal_id,
+                    vault_id,
+                    envelope_revision,
+                    allowed_scope_ids,
+                    relationship_id,
+                )
+                is None
+            ):
+                return True
+            raise
+        return (
+            first is not None
+            and self._record_integer(first, "deleted") == 1
+        )
 
     def get_scoped_vault_snapshot(
         self,

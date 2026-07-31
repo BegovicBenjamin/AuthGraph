@@ -133,6 +133,29 @@ class ScopedGraphRepository(VaultRepository, Protocol):
         entity_id: str,
     ) -> ScopedEncryptedEntityRow | None: ...
 
+    def replace_scoped_entity(
+        self,
+        principal_id: str,
+        vault_id: str,
+        envelope_revision: int,
+        allowed_scope_ids: tuple[str, ...],
+        expected_record_revision: int,
+        row: ScopedEncryptedEntityRow,
+    ) -> bool: ...
+
+    def delete_scoped_entity(
+        self,
+        principal_id: str,
+        vault_id: str,
+        envelope_revision: int,
+        allowed_scope_ids: tuple[str, ...],
+        entity_id: str,
+        expected_record_revision: int,
+    ) -> bool:
+        """Delete an unconnected entity with an optimistic revision check."""
+
+        ...
+
     def put_scoped_relationship(
         self,
         principal_id: str,
@@ -140,6 +163,48 @@ class ScopedGraphRepository(VaultRepository, Protocol):
         envelope_revision: int,
         allowed_scope_ids: tuple[str, ...],
         row: ScopedEncryptedRelationshipRow,
+    ) -> bool: ...
+
+    def put_scoped_entity_relationship_bundle(
+        self,
+        principal_id: str,
+        vault_id: str,
+        envelope_revision: int,
+        allowed_scope_ids: tuple[str, ...],
+        entity_rows: tuple[ScopedEncryptedEntityRow, ...],
+        relationship_row: ScopedEncryptedRelationshipRow,
+    ) -> bool:
+        """Atomically create helper entities and one scoped relationship."""
+
+        ...
+
+    def get_scoped_relationship(
+        self,
+        principal_id: str,
+        vault_id: str,
+        envelope_revision: int,
+        allowed_scope_ids: tuple[str, ...],
+        relationship_id: str,
+    ) -> ScopedEncryptedRelationshipRow | None: ...
+
+    def replace_scoped_relationship(
+        self,
+        principal_id: str,
+        vault_id: str,
+        envelope_revision: int,
+        allowed_scope_ids: tuple[str, ...],
+        expected_record_revision: int,
+        row: ScopedEncryptedRelationshipRow,
+    ) -> bool: ...
+
+    def delete_scoped_relationship(
+        self,
+        principal_id: str,
+        vault_id: str,
+        envelope_revision: int,
+        allowed_scope_ids: tuple[str, ...],
+        relationship_id: str,
+        expected_record_revision: int,
     ) -> bool: ...
 
     def get_scoped_vault_snapshot(

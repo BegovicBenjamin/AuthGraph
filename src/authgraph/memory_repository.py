@@ -90,6 +90,10 @@ def _valid_scoped_payload(payload: object) -> bool:
     )
 
 
+def _valid_record_revision(value: object) -> bool:
+    return type(value) is int and value > 0
+
+
 def _valid_protection_scope_row(
     row: object,
     *,
@@ -116,6 +120,7 @@ def _valid_scoped_entity_row(
         and row.vault_id == vault_id
         and _valid_opaque_id(row.scope_id)
         and _valid_opaque_id(row.entity_id)
+        and _valid_record_revision(row.record_revision)
         and _valid_scoped_payload(row.payload)
         and row.payload.key_version == expected_key_version
     )
@@ -134,6 +139,7 @@ def _valid_scoped_relationship_row(
         and _valid_opaque_id(row.relationship_id)
         and _valid_opaque_id(row.from_entity_id)
         and _valid_opaque_id(row.to_entity_id)
+        and _valid_record_revision(row.record_revision)
         and _valid_scoped_payload(row.payload)
         and row.payload.key_version == expected_key_version
     )
@@ -508,6 +514,7 @@ class InMemoryGraphRepository:
                 or row.vault_id != vault_id
                 or not _valid_opaque_id(row.scope_id)
                 or not _valid_opaque_id(row.entity_id)
+                or row.record_revision != 1
                 or not _valid_scoped_payload(row.payload)
             ):
                 return False
@@ -588,6 +595,131 @@ class InMemoryGraphRepository:
                 raise IntegrityViolation()
             return row
 
+    def replace_scoped_entity(
+        self,
+        principal_id: str,
+        vault_id: str,
+        envelope_revision: int,
+        allowed_scope_ids: tuple[str, ...],
+        expected_record_revision: int,
+        row: ScopedEncryptedEntityRow,
+    ) -> bool:
+        if (
+            not _valid_scope_ids(allowed_scope_ids)
+            or not _valid_record_revision(expected_record_revision)
+            or not isinstance(row, ScopedEncryptedEntityRow)
+            or row.vault_id != vault_id
+            or row.scope_id not in allowed_scope_ids
+            or row.record_revision != expected_record_revision + 1
+            or not _valid_scoped_payload(row.payload)
+        ):
+            return False
+        with self._lock:
+            vault = self._owned_scoped_vault(
+                principal_id,
+                vault_id,
+                envelope_revision,
+            )
+            scope = self._protection_scopes.get((vault_id, row.scope_id))
+            current = self._scoped_entities.get(
+                (vault_id, row.entity_id)
+            )
+            if (
+                vault is None
+                or not _valid_protection_scope_row(
+                    scope,
+                    vault_id=vault_id,
+                    scope_id=row.scope_id,
+                )
+                or scope.envelope.root_key_version
+                != vault.envelope.key_version
+                or not _valid_scoped_entity_row(
+                    row,
+                    vault_id=vault_id,
+                    expected_key_version=scope.envelope.scope_key_version,
+                )
+            ):
+                return False
+            if current == row:
+                return True
+            if (
+                not _valid_scoped_entity_row(
+                    current,
+                    vault_id=vault_id,
+                    expected_key_version=scope.envelope.scope_key_version,
+                )
+                or current.entity_id != row.entity_id
+                or current.scope_id != row.scope_id
+                or current.record_revision != expected_record_revision
+            ):
+                return False
+            self._scoped_entities[(vault_id, row.entity_id)] = row
+            return True
+
+    def delete_scoped_entity(
+        self,
+        principal_id: str,
+        vault_id: str,
+        envelope_revision: int,
+        allowed_scope_ids: tuple[str, ...],
+        entity_id: str,
+        expected_record_revision: int,
+    ) -> bool:
+        if (
+            not _valid_scope_ids(allowed_scope_ids)
+            or not _valid_opaque_id(entity_id)
+            or not _valid_record_revision(expected_record_revision)
+        ):
+            return False
+        with self._lock:
+            vault = self._owned_scoped_vault(
+                principal_id,
+                vault_id,
+                envelope_revision,
+            )
+            row = self._scoped_entities.get((vault_id, entity_id))
+            if (
+                vault is None
+                or not isinstance(row, ScopedEncryptedEntityRow)
+                or row.scope_id not in allowed_scope_ids
+            ):
+                return False
+            scope = self._protection_scopes.get((vault_id, row.scope_id))
+            if (
+                not _valid_protection_scope_row(
+                    scope,
+                    vault_id=vault_id,
+                    scope_id=row.scope_id,
+                )
+                or scope.envelope.root_key_version
+                != vault.envelope.key_version
+                or not _valid_scoped_entity_row(
+                    row,
+                    vault_id=vault_id,
+                    expected_key_version=scope.envelope.scope_key_version,
+                )
+                or row.entity_id != entity_id
+                or row.record_revision != expected_record_revision
+                or any(
+                    relationship_vault == vault_id
+                    and (
+                        not isinstance(
+                            relationship,
+                            ScopedEncryptedRelationshipRow,
+                        )
+                        or relationship.from_entity_id == entity_id
+                        or relationship.to_entity_id == entity_id
+                    )
+                    for (
+                        relationship_vault,
+                        _,
+                    ), relationship in self._scoped_relationships.items()
+                )
+            ):
+                return False
+            del self._scoped_entities[(vault_id, entity_id)]
+            return True
+
     def put_scoped_relationship(
         self,
         principal_id: str,
@@ -605,6 +737,7 @@ class InMemoryGraphRepository:
             or not _valid_opaque_id(row.relationship_id)
             or not _valid_opaque_id(row.from_entity_id)
             or not _valid_opaque_id(row.to_entity_id)
+            or row.record_revision != 1
             or not _valid_scoped_payload(row.payload)
         ):
             return False
@@ -664,6 +797,352 @@ class InMemoryGraphRepository:
             ):
                 return False
             self._scoped_relationships[key] = row
+            return True
+
+    def put_scoped_entity_relationship_bundle(
+        self,
+        principal_id: str,
+        vault_id: str,
+        envelope_revision: int,
+        allowed_scope_ids: tuple[str, ...],
+        entity_rows: tuple[ScopedEncryptedEntityRow, ...],
+        relationship_row: ScopedEncryptedRelationshipRow,
+    ) -> bool:
+        if (
+            not _valid_scope_ids(allowed_scope_ids)
+            or not isinstance(entity_rows, tuple)
+            or not 1 <= len(entity_rows) <= 2
+            or not isinstance(
+                relationship_row,
+                ScopedEncryptedRelationshipRow,
+            )
+            or relationship_row.vault_id != vault_id
+            or relationship_row.scope_id not in allowed_scope_ids
+            or relationship_row.record_revision != 1
+            or not _valid_scoped_payload(relationship_row.payload)
+            or any(
+                not isinstance(row, ScopedEncryptedEntityRow)
+                or row.vault_id != vault_id
+                or row.scope_id != relationship_row.scope_id
+                or row.record_revision != 1
+                or not _valid_scoped_payload(row.payload)
+                for row in entity_rows
+            )
+        ):
+            return False
+        new_by_id = {row.entity_id: row for row in entity_rows}
+        endpoint_ids = {
+            relationship_row.from_entity_id,
+            relationship_row.to_entity_id,
+        }
+        if (
+            len(new_by_id) != len(entity_rows)
+            or set(new_by_id) - endpoint_ids
+        ):
+            return False
+
+        with self._lock:
+            vault = self._owned_scoped_vault(
+                principal_id,
+                vault_id,
+                envelope_revision,
+            )
+            relationship_scope = self._protection_scopes.get(
+                (vault_id, relationship_row.scope_id)
+            )
+            if (
+                vault is None
+                or not _valid_protection_scope_row(
+                    relationship_scope,
+                    vault_id=vault_id,
+                    scope_id=relationship_row.scope_id,
+                )
+                or relationship_scope.envelope.root_key_version
+                != vault.envelope.key_version
+                or not _valid_scoped_relationship_row(
+                    relationship_row,
+                    vault_id=vault_id,
+                    expected_key_version=(
+                        relationship_scope.envelope.scope_key_version
+                    ),
+                )
+                or any(
+                    not _valid_scoped_entity_row(
+                        row,
+                        vault_id=vault_id,
+                        expected_key_version=(
+                            relationship_scope.envelope.scope_key_version
+                        ),
+                    )
+                    for row in entity_rows
+                )
+            ):
+                return False
+
+            existing_bundle_is_exact = (
+                all(
+                    self._scoped_entities.get(
+                        (vault_id, row.entity_id)
+                    )
+                    == row
+                    for row in entity_rows
+                )
+                and self._scoped_relationships.get(
+                    (vault_id, relationship_row.relationship_id)
+                )
+                == relationship_row
+            )
+            if not existing_bundle_is_exact and (
+                any(
+                    stored_entity_id in new_by_id
+                    for _, stored_entity_id in self._scoped_entities
+                )
+                or any(
+                    stored_relationship_id
+                    == relationship_row.relationship_id
+                    for (
+                        _,
+                        stored_relationship_id,
+                    ) in self._scoped_relationships
+                )
+            ):
+                return False
+
+            for entity_id in (
+                relationship_row.from_entity_id,
+                relationship_row.to_entity_id,
+            ):
+                row = new_by_id.get(entity_id)
+                if row is None:
+                    row = self._scoped_entities.get(
+                        (vault_id, entity_id)
+                    )
+                if not isinstance(row, ScopedEncryptedEntityRow):
+                    return False
+                scope = self._protection_scopes.get(
+                    (vault_id, row.scope_id)
+                )
+                if (
+                    row.scope_id not in allowed_scope_ids
+                    or not _valid_protection_scope_row(
+                        scope,
+                        vault_id=vault_id,
+                        scope_id=row.scope_id,
+                    )
+                    or scope.envelope.root_key_version
+                    != vault.envelope.key_version
+                    or not _valid_scoped_entity_row(
+                        row,
+                        vault_id=vault_id,
+                        expected_key_version=(
+                            scope.envelope.scope_key_version
+                        ),
+                    )
+                    or row.entity_id != entity_id
+                ):
+                    return False
+
+            if existing_bundle_is_exact:
+                return True
+
+            for row in entity_rows:
+                self._scoped_entities[(vault_id, row.entity_id)] = row
+            self._scoped_relationships[
+                (vault_id, relationship_row.relationship_id)
+            ] = relationship_row
+            return True
+
+    def get_scoped_relationship(
+        self,
+        principal_id: str,
+        vault_id: str,
+        envelope_revision: int,
+        allowed_scope_ids: tuple[str, ...],
+        relationship_id: str,
+    ) -> ScopedEncryptedRelationshipRow | None:
+        if (
+            not _valid_scope_ids(allowed_scope_ids)
+            or not _valid_opaque_id(relationship_id)
+        ):
+            return None
+        allowed = frozenset(allowed_scope_ids)
+        with self._lock:
+            vault = self._owned_scoped_vault(
+                principal_id,
+                vault_id,
+                envelope_revision,
+            )
+            if vault is None:
+                return None
+            row = self._scoped_relationships.get(
+                (vault_id, relationship_id)
+            )
+            if row is None:
+                return None
+            if not isinstance(row, ScopedEncryptedRelationshipRow):
+                raise IntegrityViolation()
+            if row.scope_id not in allowed:
+                return None
+            relationship_scope = self._protection_scopes.get(
+                (vault_id, row.scope_id)
+            )
+            source = self._scoped_entities.get(
+                (vault_id, row.from_entity_id)
+            )
+            target = self._scoped_entities.get(
+                (vault_id, row.to_entity_id)
+            )
+            if (
+                not isinstance(source, ScopedEncryptedEntityRow)
+                or not isinstance(target, ScopedEncryptedEntityRow)
+            ):
+                raise IntegrityViolation()
+            if (
+                source.scope_id not in allowed
+                or target.scope_id not in allowed
+            ):
+                return None
+            source_scope = self._protection_scopes.get(
+                (vault_id, source.scope_id)
+            )
+            target_scope = self._protection_scopes.get(
+                (vault_id, target.scope_id)
+            )
+            if (
+                not _valid_protection_scope_row(
+                    relationship_scope,
+                    vault_id=vault_id,
+                    scope_id=row.scope_id,
+                )
+                or not _valid_protection_scope_row(
+                    source_scope,
+                    vault_id=vault_id,
+                    scope_id=source.scope_id,
+                )
+                or not _valid_protection_scope_row(
+                    target_scope,
+                    vault_id=vault_id,
+                    scope_id=target.scope_id,
+                )
+                or relationship_scope.envelope.root_key_version
+                != vault.envelope.key_version
+                or source_scope.envelope.root_key_version
+                != vault.envelope.key_version
+                or target_scope.envelope.root_key_version
+                != vault.envelope.key_version
+                or not _valid_scoped_relationship_row(
+                    row,
+                    vault_id=vault_id,
+                    expected_key_version=(
+                        relationship_scope.envelope.scope_key_version
+                    ),
+                )
+                or not _valid_scoped_entity_row(
+                    source,
+                    vault_id=vault_id,
+                    expected_key_version=(
+                        source_scope.envelope.scope_key_version
+                    ),
+                )
+                or not _valid_scoped_entity_row(
+                    target,
+                    vault_id=vault_id,
+                    expected_key_version=(
+                        target_scope.envelope.scope_key_version
+                    ),
+                )
+                or row.relationship_id != relationship_id
+                or source.entity_id != row.from_entity_id
+                or target.entity_id != row.to_entity_id
+            ):
+                raise IntegrityViolation()
+            return row
+
+    def replace_scoped_relationship(
+        self,
+        principal_id: str,
+        vault_id: str,
+        envelope_revision: int,
+        allowed_scope_ids: tuple[str, ...],
+        expected_record_revision: int,
+        row: ScopedEncryptedRelationshipRow,
+    ) -> bool:
+        if (
+            not _valid_scope_ids(allowed_scope_ids)
+            or not _valid_record_revision(expected_record_revision)
+            or not isinstance(row, ScopedEncryptedRelationshipRow)
+            or row.vault_id != vault_id
+            or row.scope_id not in allowed_scope_ids
+            or row.record_revision != expected_record_revision + 1
+            or not _valid_scoped_payload(row.payload)
+        ):
+            return False
+        with self._lock:
+            current = self.get_scoped_relationship(
+                principal_id,
+                vault_id,
+                envelope_revision,
+                allowed_scope_ids,
+                row.relationship_id,
+            )
+            if current == row:
+                return True
+            if (
+                current is None
+                or current.scope_id != row.scope_id
+                or current.from_entity_id != row.from_entity_id
+                or current.to_entity_id != row.to_entity_id
+                or current.record_revision != expected_record_revision
+            ):
+                return False
+            relationship_scope = self._protection_scopes.get(
+                (vault_id, row.scope_id)
+            )
+            if (
+                not _valid_protection_scope_row(
+                    relationship_scope,
+                    vault_id=vault_id,
+                    scope_id=row.scope_id,
+                )
+                or not _valid_scoped_relationship_row(
+                    row,
+                    vault_id=vault_id,
+                    expected_key_version=(
+                        relationship_scope.envelope.scope_key_version
+                    ),
+                )
+            ):
+                return False
+            self._scoped_relationships[
+                (vault_id, row.relationship_id)
+            ] = row
+            return True
+
+    def delete_scoped_relationship(
+        self,
+        principal_id: str,
+        vault_id: str,
+        envelope_revision: int,
+        allowed_scope_ids: tuple[str, ...],
+        relationship_id: str,
+        expected_record_revision: int,
+    ) -> bool:
+        if not _valid_record_revision(expected_record_revision):
+            return False
+        with self._lock:
+            row = self.get_scoped_relationship(
+                principal_id,
+                vault_id,
+                envelope_revision,
+                allowed_scope_ids,
+                relationship_id,
+            )
+            if (
+                row is None
+                or row.record_revision != expected_record_revision
+            ):
+                return False
+            del self._scoped_relationships[(vault_id, relationship_id)]
             return True
 
     def get_scoped_vault_snapshot(

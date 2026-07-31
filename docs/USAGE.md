@@ -1,26 +1,20 @@
 # Using AuthGraph
 
-This guide documents the code that exists today. It covers the original
-whole-vault API and the first scoped-encryption, OTP, and GraphRAG slice.
+This guide covers the API that new applications should use.
 
 > AuthGraph is an early prototype. Use synthetic data only.
 
-## What you need
+## 1. Install
+
+You need:
 
 - Python 3.11 or newer
 - Neo4j 5.7 or newer
-- An encrypted Neo4j connection
-- A Neo4j account limited to the AuthGraph database
+- a TLS Neo4j address
+- a schema account for setup
+- a restricted runtime account for your application
 
-Neo4j may be a managed service such as Aura or a server you operate. AuthGraph
-does not install or start Neo4j.
-
-AuthGraph is a Python library. It currently has no `authgraph` command, web
-server, login page, chatbot, email sender, or admin panel.
-
-## Install
-
-From the repository:
+Install from this repository:
 
 ```bash
 python3 -m venv .venv
@@ -28,156 +22,155 @@ source .venv/bin/activate
 python3 -m pip install .
 ```
 
-For local development, use an editable install:
+For local development:
 
 ```bash
 python3 -m pip install -e .
 ```
 
-## Prepare Neo4j
+AuthGraph does not install or start Neo4j.
 
-Run [neo4j/schema.cypher](../neo4j/schema.cypher) once against the database.
-For example, `cypher-shell` can prompt for the password:
+## 2. Install or verify the Neo4j schema
+
+Apply the packaged fixed schema:
 
 ```bash
-cypher-shell -a neo4j+s://YOUR_HOST -u YOUR_USER \
-  -d YOUR_DATABASE -f neo4j/schema.cypher
+authgraph schema apply \
+  --uri neo4j+s://YOUR_HOST \
+  --database YOUR_DATABASE \
+  --username YOUR_SCHEMA_USER
 ```
 
-Then verify that the expected constraints exist:
+The command prompts for the password. AuthGraph deliberately has no
+`--password` argument because command-line arguments can be exposed by shell
+history and process listings.
 
-```cypher
-SHOW CONSTRAINTS;
+To read the password from a file:
+
+```bash
+authgraph schema apply \
+  --uri neo4j+s://YOUR_HOST \
+  --database YOUR_DATABASE \
+  --username YOUR_SCHEMA_USER \
+  --password-file /secure/path/neo4j-password \
+  --no-input
 ```
 
-Use `neo4j+s://` with a CA-signed certificate. `neo4j+ssc://` also encrypts
-traffic but accepts a self-signed certificate and should be used only when that
-choice is deliberate.
+Verify without applying anything:
 
-## Create the services
+```bash
+authgraph schema verify \
+  --uri neo4j+s://YOUR_HOST \
+  --database YOUR_DATABASE \
+  --username YOUR_RUNTIME_USER
+```
+
+The same values can come from:
+
+- `AUTHGRAPH_NEO4J_URI`
+- `AUTHGRAPH_NEO4J_DATABASE`
+- `AUTHGRAPH_NEO4J_USERNAME`
+- `AUTHGRAPH_NEO4J_PASSWORD_FILE`
+
+Only `neo4j+s://`, `neo4j+ssc://`, `bolt+s://`, and `bolt+ssc://` addresses are
+accepted. Prefer `+s` with a CA-signed certificate. Use `+ssc` only when
+accepting a self-signed certificate is deliberate.
+
+The schema command never creates or drops a database.
+
+## 3. Create the main service
 
 ```python
 from neo4j import GraphDatabase
 
 from authgraph import (
-    AuthGraphService,
+    AuthGraph,
     CryptoEngine,
     GraphPolicy,
-    InMemorySessionBroker,
-    LayeredGraphService,
-    Neo4jGraphRepository,
     Neo4jPublicGraphRepository,
+    Neo4jScopedGraphRepository,
+    ScopedAuthGraphService,
+    ScopedSessionBroker,
 )
 
 driver = GraphDatabase.driver(
     "neo4j+s://YOUR_HOST",
-    auth=("YOUR_USER", "YOUR_NEO4J_PASSWORD"),
+    auth=("YOUR_RUNTIME_USER", "YOUR_NEO4J_PASSWORD"),
 )
 driver.verify_connectivity()
 
-private_repository = Neo4jGraphRepository(driver, database="YOUR_DATABASE")
+private_repository = Neo4jScopedGraphRepository(
+    driver,
+    database="YOUR_DATABASE",
+)
 public_repository = Neo4jPublicGraphRepository(
     driver,
     database="YOUR_DATABASE",
 )
-sessions = InMemorySessionBroker(
+sessions = ScopedSessionBroker(
     default_ttl_seconds=300,
     max_ttl_seconds=1800,
 )
-protected = AuthGraphService(
+private = ScopedAuthGraphService(
     private_repository,
     CryptoEngine(),
     sessions,
 )
 ```
 
-`LayeredGraphService` combines a readable public graph with encrypted owner
-overlays. Public writes require an authorization decision from your
-application. This small example uses a server-only capability:
+Public writes need a decision from your trusted application. This example uses
+a server-only capability:
 
 ```python
-authorized_publisher = object()
+publisher_capability = object()
 
 def may_publish(publisher, graph_id):
     return (
-        publisher is authorized_publisher
-        and graph_id == "support-graph"
+        publisher is publisher_capability
+        and graph_id == "support"
     )
 
-graph = LayeredGraphService(
-    protected,
+graph = AuthGraph(
+    private,
     public_repository,
     default_policy=GraphPolicy(allow_public_overrides=True),
     public_write_authorizer=may_publish,
 )
 ```
 
-Do not send `authorized_publisher` to a browser or AI. In a real application,
-the authorizer would normally inspect a trusted staff or service identity.
+Do not send the publisher capability, Neo4j credentials, or service objects to
+an AI.
 
-## Choose a private format
+## 4. Create a vault and protection scopes
 
-AuthGraph currently keeps two private formats separate:
-
-| Format | Service | Encryption boundary |
-|---|---|---|
-| Legacy v1 | `AuthGraphService` | One key unlocks the whole owner vault |
-| Scoped v2 | `ScopedAuthGraphService` | Every protection scope has an independent key |
-
-Use scoped v2 for new scope-isolation experiments. Existing v1 records are not
-automatically migrated to v2.
-
-Create the scoped service with the scoped Neo4j adapter:
-
-```python
-from authgraph import (
-    CryptoEngine,
-    Neo4jScopedGraphRepository,
-    ScopedAuthGraphService,
-    ScopedSessionBroker,
-)
-
-scoped_repository = Neo4jScopedGraphRepository(
-    driver,
-    database="YOUR_DATABASE",
-)
-scoped_sessions = ScopedSessionBroker(
-    default_ttl_seconds=300,
-    max_ttl_seconds=1800,
-)
-scoped = ScopedAuthGraphService(
-    scoped_repository,
-    CryptoEngine(),
-    scoped_sessions,
-)
-```
-
-Do not use `Neo4jGraphRepository` with `ScopedAuthGraphService`.
-
-## Create an owner vault
-
-Your login system first authenticates a person. It then gives AuthGraph an
-opaque identity-provider subject:
+Your login system supplies an opaque identity-provider ID, not a name or email:
 
 ```python
 principal_id = "idp|opaque-subject-7f921"
 passphrase = bytearray(b"a long synthetic test passphrase")
 
 try:
-    vault_id = protected.create_vault(principal_id, passphrase)
+    vault_id = graph.create_vault(principal_id, passphrase)
+    profile_scope = graph.create_scope(
+        principal_id,
+        vault_id,
+        passphrase,
+    )
+    orders_scope = graph.create_scope(
+        principal_id,
+        vault_id,
+        passphrase,
+    )
 finally:
     passphrase[:] = b"\x00" * len(passphrase)
 ```
 
-Keep the returned `vault_id` in your trusted account store. Do not use a name,
-email, customer number, or other personal information as `principal_id` or
-`vault_id`.
+Store the returned `vault_id` and scope mapping in your trusted account store.
+Scope IDs are backend authorization data. Do not expose them to the AI.
 
-A new passphrase must contain at least 15 UTF-8 bytes. A strong, unique
-passphrase is still required because a stolen key envelope can be attacked
-offline.
+A new passphrase must contain at least 15 UTF-8 bytes.
 
-## Unlock and lock
+## 5. Unlock only the needed scopes
 
 Collect the passphrase in a dedicated secure form, not in chatbot text:
 
@@ -185,672 +178,349 @@ Collect the passphrase in a dedicated secure form, not in chatbot text:
 passphrase = bytearray(b"a long synthetic test passphrase")
 
 try:
-    context = protected.unlock(
+    context = graph.unlock(
         principal_id,
         vault_id,
         passphrase,
+        (orders_scope,),
         ttl_seconds=300,
     )
 finally:
     passphrase[:] = b"\x00" * len(passphrase)
 ```
 
-`context` is an opaque bearer capability. Keep it on the server. Never send it
-to an AI, put it in a URL, or log it.
+`context` is a temporary bearer capability. Keep it on the server. Never put
+it in a URL, log, prompt, browser storage, or model tool argument.
 
-Lock explicitly when the protected interaction ends:
+End access explicitly:
 
 ```python
-protected.lock(context)
+graph.lock(context)
 ```
 
-The context also stops working after its TTL, revocation, passphrase change,
-broker shutdown, or process restart.
+Expiry, lock, password change, provider revocation, shutdown, or process
+restart also removes future access.
 
-## Create nodes
+## 6. Create nodes
 
-Private is the default:
+Private storage is the default:
 
 ```python
-from authgraph import ProtectionLevel
-
-private_order = graph.create_entity(
-    "support-graph",
+order = graph.create_entity(
+    "support",
     "Order",
     {
         "order_number": "ORDER-1001",
         "status": "delayed",
     },
     context=context,
+    scope_id=orders_scope,
+    idempotency_key="create-order-1001",
 )
 ```
 
-AuthGraph encrypts the node kind and properties before the private repository
-writes them to Neo4j.
+The idempotency key makes an exact retry return the same node ID. Reusing the
+key with different data fails. The key itself is not stored in Neo4j.
 
-Create an intentionally public node only when the graph policy permits it and
-the trusted publisher is authorized:
+Create an intentionally public node only when policy and authorization allow
+it:
 
 ```python
-public_product = graph.create_entity(
-    "support-graph",
+from authgraph import ProtectionLevel
+
+product = graph.create_entity(
+    "support",
     "Product",
     {"name": "Example Headphones"},
     protection=ProtectionLevel.PUBLIC,
-    publisher=authorized_publisher,
+    publisher=publisher_capability,
 )
 ```
 
-Public kinds and properties are plaintext at AuthGraph's application layer.
-Neo4j access control, TLS, disk encryption, and backup security are still
-required.
+Public kinds and properties are plaintext to Neo4j and database backups.
 
-## Create connections
+## 7. Create connections
 
-`create_entity()` returns a `GraphEntityRef`. Use those references to connect
-nodes:
+Private-to-private:
 
 ```python
-private_connection = graph.connect(
-    "support-graph",
-    private_order,
-    public_product,
+customer = graph.create_entity(
+    "support",
+    "Customer",
+    {"display_name": "Synthetic Customer"},
+    context=context,
+    scope_id=orders_scope,
+)
+
+placed = graph.connect(
+    "support",
+    customer,
+    order,
+    "PLACED",
+    {"channel": "web"},
+    context=context,
+    scope_id=orders_scope,
+    idempotency_key="connect-order-1001",
+)
+```
+
+Private-to-public also works:
+
+```python
+contains = graph.connect(
+    "support",
+    order,
+    product,
     "CONTAINS",
     {"quantity": 1},
     context=context,
-    protection=ProtectionLevel.PRIVATE,
+    scope_id=orders_scope,
 )
 ```
 
-A private connection may join private nodes, or it may use encrypted anchors
-to public nodes. A public connection is allowed only between two public nodes:
+AuthGraph creates an encrypted anchor for the public endpoint and commits the
+anchor and encrypted connection atomically. Retry-safe idempotency for this
+mixed case is not implemented yet.
+
+A plaintext public connection is allowed only between two public nodes:
 
 ```python
 another_public_product = graph.create_entity(
-    "support-graph",
+    "support",
     "Product",
     {"name": "Example Case"},
     protection=ProtectionLevel.PUBLIC,
-    publisher=authorized_publisher,
+    publisher=publisher_capability,
 )
 
-public_connection = graph.connect(
-    "support-graph",
-    public_product,
+related = graph.connect(
+    "support",
+    product,
     another_public_product,
     "RELATED_TO",
     {},
     protection=ProtectionLevel.PUBLIC,
-    publisher=authorized_publisher,
+    publisher=publisher_capability,
 )
 ```
 
-## Read graph views
+## 8. Read, update, and delete private data
 
-The locked view reads only the public repository:
+Resolve a node:
 
 ```python
-locked_view = graph.get_public_view("support-graph")
+record = graph.get_entity("support", order, context=context)
+print(record.kind, record.properties, record.record_revision)
 ```
 
-The unlocked view adds private records from exactly the vault represented by
-`context`:
+Update with optimistic revision checking:
 
 ```python
-unlocked_view = graph.get_unlocked_view(
-    "support-graph",
-    context,
-)
-```
-
-The result contains:
-
-- `graph_id`
-- `entities`
-- `relationships`
-- `private_overlay_included`
-- `locked_disclosure`
-
-Each returned entity and relationship says whether it was `PUBLIC` or
-`PRIVATE`.
-
-Important: the current unlocked layered view first decrypts one bounded vault
-snapshot in the trusted Python process and then filters it by `graph_id`.
-It is suitable for small tests, not as a production chatbot retriever.
-
-## Use the encrypted vault API directly
-
-`AuthGraphService` can be used without the public layer:
-
-```python
-person_id = protected.create_entity(
-    context,
-    "Person",
-    {"display_name": "Synthetic Person"},
-)
-order_id = protected.create_entity(
-    context,
+updated = graph.update_entity(
+    "support",
+    order,
     "Order",
-    {"status": "processing"},
+    {
+        "order_number": "ORDER-1001",
+        "status": "shipped",
+    },
+    context=context,
+    expected_revision=record.record_revision,
 )
-relationship_id = protected.connect(
-    context,
-    person_id,
-    order_id,
+```
+
+The update fails if another writer already changed that revision.
+
+Relationships have the same pattern:
+
+```python
+edge = graph.get_relationship("support", placed, context=context)
+
+edge = graph.update_relationship(
+    "support",
+    placed,
     "PLACED",
-    {"source": "test"},
+    {"channel": "phone"},
+    context=context,
+    expected_revision=edge.record_revision,
 )
 
-person = protected.get_entity(context, person_id)
-nearby = protected.get_neighborhood(context, person_id, limit=25)
-snapshot = protected.get_vault_snapshot(
-    context,
-    entity_limit=100,
-    relationship_limit=200,
+graph.delete_relationship(
+    "support",
+    placed,
+    context=context,
+    expected_revision=edge.record_revision,
 )
 ```
 
-`get_vault_snapshot()` deliberately returns a complete small vault as
-caller-owned plaintext. Do not log, cache, or pass it to a model unless
-exposing the complete vault is the intended result.
-
-## Use scoped encryption
-
-Create a v2 vault and its independent protection scopes. Scope IDs are opaque;
-keep the meaning of each scope in trusted application configuration.
+Node deletion is restrictive:
 
 ```python
-principal_id = "idp|opaque-subject-7f921"
-passphrase = bytearray(b"a long synthetic test passphrase")
+graph.delete_relationship(
+    "support",
+    contains,
+    context=context,
+    expected_revision=1,
+)
 
-try:
-    vault_id = scoped.create_vault(principal_id, passphrase)
-    profile_scope = scoped.create_protection_scope(
-        principal_id,
-        vault_id,
-        passphrase,
-    )
-    orders_scope = scoped.create_protection_scope(
-        principal_id,
-        vault_id,
-        passphrase,
-    )
-finally:
-    passphrase[:] = b"\x00" * len(passphrase)
+graph.delete_entity(
+    "support",
+    order,
+    context=context,
+    expected_revision=updated.record_revision,
+)
 ```
 
-Your trusted application policy chooses the scope IDs. The model and browser
-must not choose them. `ScopedAuthGraphService.unlock()` validates the tuple but
-does not decide which scopes a user should receive; that authorization check
-belongs to the backend before this call.
+It fails while any encrypted connection still touches the node, including a
+connection hidden by a locked scope. AuthGraph never performs an unrestricted
+cascade delete.
 
-Unlock exactly those scopes:
+Public update, delete, lookup by relationship reference, and public
+idempotency are not implemented.
+
+## 9. Read graph views
+
+The locked view contains only public records:
 
 ```python
-passphrase = bytearray(b"a long synthetic test passphrase")
-
-try:
-    context = scoped.unlock(
-        principal_id,
-        vault_id,
-        passphrase,
-        (profile_scope, orders_scope),
-        ttl_seconds=300,
-    )
-finally:
-    passphrase[:] = b"\x00" * len(passphrase)
+public_view = graph.get_public_view("support")
 ```
 
-Create scoped nodes and a scoped connection:
+The unlocked view adds only private wrappers visible to the current scope
+session:
 
 ```python
-profile_id = scoped.create_entity(
-    context,
-    profile_scope,
-    "Profile",
-    {"display_name": "Synthetic Person"},
-)
-order_id = scoped.create_entity(
-    context,
-    orders_scope,
-    "Order",
-    {"reference": "ORDER-1001", "status": "delayed"},
-)
-placed_id = scoped.connect(
-    context,
-    orders_scope,
-    profile_id,
-    order_id,
-    "PLACED",
-    {},
-)
+visible_view = graph.get_unlocked_view("support", context)
 ```
 
-The connection has its own scope. It is returned only if the session has the
-connection scope and both endpoint scopes.
+Private anchors are resolved to their public endpoints and are not exposed as
+semantic nodes.
 
-Read one node or a bounded complete view of only the granted scopes:
+## 10. Give a chatbot a bounded GraphRAG tool
 
-```python
-order = scoped.get_entity(context, order_id)
-visible = scoped.get_vault_snapshot(
-    context,
-    entity_limit=100,
-    relationship_limit=200,
-)
-scoped.lock(context)
-```
-
-`ScopedVaultSnapshot` contains plaintext owned by your caller. Do not cache or
-log it. A session holding only `orders_scope` cannot read `profile_scope`, and
-no session can read another owner's scopes.
-
-## Unlock scoped data with a one-time code
-
-The included OTP path is a security flow, not an email service:
-
-```text
-issue code -> your app delivers it -> verify once -> fixed scope grant
-           -> trusted key provider releases those scope keys -> session
-```
-
-The code never derives or decrypts a key. It only authorizes a provider. The
-included `InMemoryScopeKeyProvider` is for synthetic, single-process tests; use
-a real KMS/HSM-backed provider in production.
-
-First enroll selected scope keys into the test provider. This is an
-administrative operation that requires the vault passphrase:
-
-```python
-from authgraph import (
-    InMemoryOneTimeCodeBroker,
-    InMemoryScopeKeyProvider,
-    ScopeGrantPolicy,
-    UnlockProfile,
-)
-
-key_provider = InMemoryScopeKeyProvider()
-passphrase = bytearray(b"a long synthetic test passphrase")
-
-try:
-    scoped.enroll_key_release_provider(
-        principal_id,
-        vault_id,
-        passphrase,
-        (orders_scope,),
-        key_provider,
-    )
-finally:
-    passphrase[:] = b"\x00" * len(passphrase)
-```
-
-Configure a server-owned profile. The user and AI cannot change its scope set:
-
-```python
-profile = UnlockProfile(
-    profile_id="order-support",
-    scope_ids=(orders_scope,),
-    session_ttl_seconds=180,
-    allow_one_time_code=True,
-)
-grant_policy = ScopeGrantPolicy({profile.profile_id: profile})
-otp = InMemoryOneTimeCodeBroker(
-    ttl_seconds=300,
-    max_attempts=5,
-)
-```
-
-Issue from a trusted HTTP endpoint after the application knows the
-authenticated principal, vault, browser transaction, and pre-verified delivery
-destination:
-
-```python
-client_binding = "opaque-browser-transaction"
-epoch = scoped.get_authorization_epoch(principal_id, vault_id)
-issued = otp.issue(
-    principal_id,
-    profile.profile_id,
-    client_binding,
-    authorization_context=vault_id,
-    authorization_epoch=epoch,
-)
-
-try:
-    deliver_to_preverified_destination(memoryview(issued.code))
-finally:
-    issued.clear_code()
-```
-
-`deliver_to_preverified_destination()` is your code. AuthGraph does not accept
-an email address or send mail. Its adapter should accept the mutable view where
-possible; any immutable copy it creates cannot be wiped by AuthGraph. Add rate
-limits around issuance.
-
-Verify the submitted code in a secure form endpoint, not chatbot text:
-
-```python
-evidence = otp.verify(
-    issued.challenge_id,
-    submitted_code,
-    principal_id=principal_id,
-    profile_id=profile.profile_id,
-    client_binding=client_binding,
-)
-grant = grant_policy.authorize_one_time_code(
-    evidence,
-    vault_id=vault_id,
-    evidence_consumer=otp,
-)
-context = scoped.unlock_with_provider(
-    grant,
-    grant_policy,
-    key_provider,
-)
-```
-
-Challenges, evidence, and grants are short-lived and single-use. They are
-bound to the current vault authorization epoch, so a password change rejects
-older grants. Restarting the process loses the in-memory OTP and test-provider
-state.
-
-Remove test-provider release capability when access is revoked:
-
-```python
-key_provider.revoke_scope_keys(
-    principal_id,
-    vault_id,
-    (orders_scope,),
-)
-# Or remove every enrolled scope for this vault:
-key_provider.revoke_vault(principal_id, vault_id)
-```
-
-This blocks future provider unlocks. It does not recall plaintext already sent
-to a caller or model.
-
-At shutdown:
-
-```python
-otp.close()
-grant_policy.close()
-key_provider.close()
-scoped_sessions.close_all()
-driver.close()
-```
-
-## Change a passphrase
-
-```python
-old_passphrase = bytearray(b"a long synthetic test passphrase")
-new_passphrase = bytearray(b"a different long synthetic passphrase")
-
-try:
-    protected.change_passphrase(
-        principal_id,
-        vault_id,
-        old_passphrase,
-        new_passphrase,
-    )
-finally:
-    old_passphrase[:] = b"\x00" * len(old_passphrase)
-    new_passphrase[:] = b"\x00" * len(new_passphrase)
-```
-
-This re-wraps the same vault key and revokes existing local sessions. It does
-not rotate the data-encryption key or re-encrypt records.
-
-`ScopedAuthGraphService.change_passphrase()` has the same arguments. For a v2
-vault it re-wraps the vault-wrapping key; independent scope keys and encrypted
-records stay unchanged. Existing sessions and grants from the older
-authorization epoch stop working. Previously enrolled provider slots can
-still support a newly verified grant.
-
-## Use the scoped GraphRAG gateway
-
-The current scoped adapter first asks for a bounded complete snapshot of every
-scope granted to the session and decrypts that snapshot in trusted memory.
-The gateway then removes disallowed kinds and properties, ranks relevant
-nodes, follows a bounded number of visible connections, and returns a smaller
-result with provenance. This limits what reaches the model, but it is not yet a
-targeted Neo4j read and the trusted process briefly handles the full granted
-snapshot.
-
-Create one server-owned disclosure policy:
+The model-facing method should accept only the user's question:
 
 ```python
 from authgraph import (
     DisclosurePolicy,
-    ScopedGraphViewAdapter,
     SessionBoundRetrievalTool,
     SessionVisibleGraphGateway,
 )
 
-view = ScopedGraphViewAdapter(
-    scoped,
-    graph_id="support-graph",
-)
-disclosure = DisclosurePolicy(
-    allowed_entity_kinds=frozenset({"Profile", "Order"}),
-    allowed_relationship_kinds=frozenset({"PLACED"}),
+policy = DisclosurePolicy(
+    allowed_entity_kinds=frozenset({"Order", "Product"}),
+    allowed_relationship_kinds=frozenset({"CONTAINS"}),
     entity_property_allowlist={
-        "Profile": frozenset({"display_name"}),
-        "Order": frozenset({"reference", "status"}),
+        "Order": frozenset({"order_number", "status"}),
+        "Product": frozenset({"name"}),
     },
     relationship_property_allowlist={
-        "PLACED": frozenset(),
+        "CONTAINS": frozenset({"quantity"}),
     },
-    max_candidates=20,
-    max_nodes=20,
-    max_edges=30,
+    max_nodes=12,
+    max_edges=16,
     max_hops=1,
-    max_plaintext_bytes=32 * 1024,
-    max_token_estimate=4 * 1024,
+    max_plaintext_bytes=16_384,
+    max_token_estimate=2_048,
 )
+
 gateway = SessionVisibleGraphGateway(
-    view,
-    graph_id="support-graph",
-    policy=disclosure,
+    graph,
+    graph_id="support",
+    policy=policy,
+)
+tool = SessionBoundRetrievalTool(gateway, context=context)
+
+result = tool.search("Where is my order?")
+```
+
+The AI gets `result`, not `context`. Without a context, the same tool searches
+only public data:
+
+```python
+public_tool = SessionBoundRetrievalTool(gateway)
+```
+
+AuthGraph currently obtains the private view by decrypting a bounded complete
+snapshot of the session's granted scopes in trusted memory, then filtering and
+ranking it. It does not yet run targeted search over encrypted Neo4j rows.
+
+If you send retrieved plaintext to an external AI, that AI can read it.
+AuthGraph controls retrieval; it cannot force an external service to forget
+data it received.
+
+## 11. One-time-code unlock
+
+The included OTP broker and scope-key provider can test this flow:
+
+1. your backend creates and sends a short one-time code;
+2. the code proves authorization to a trusted provider;
+3. the provider releases a fixed configured set of scope keys;
+4. AuthGraph opens a short session.
+
+The code is never an encryption key. The included implementation is in-memory
+only. Production needs real email/SMS delivery, rate limiting, abuse
+protection, and a KMS or HSM-backed key provider.
+
+See [CHATBOT_GRAPHRAG_DESIGN.md](CHATBOT_GRAPHRAG_DESIGN.md) for the trust
+boundary and provider flow.
+
+## 12. Change a passphrase and shut down
+
+```python
+graph.change_passphrase(
+    principal_id,
+    vault_id,
+    current_passphrase,
+    new_passphrase,
 )
 ```
 
-Here `graph_id` is a logical label checked against the gateway. It does not
-filter private scoped records. The protection-scope set already bound to
-`context` is the private-data isolation boundary, and the adapter maps all
-records in those granted scopes to this one logical graph.
+This rewraps the vault key and revokes older sessions. It does not decrypt and
+rewrite every graph record.
 
-Bind the security context outside the AI tool schema:
-
-```python
-tool = SessionBoundRetrievalTool(
-    gateway,
-    context=context,
-)
-result = tool.search("Where is my delayed order?")
-model_payload = result.canonical_json_bytes()
-```
-
-Register only `tool.search(question)` with a model. Do not register
-`gateway.retrieve()` directly: it also accepts trusted-only context and vector
-arguments. The model must not receive `context`, owner/vault/scope IDs, safety
-limits, or arbitrary Cypher.
-
-`plaintext_bytes` is the exact size of `canonical_json_bytes()`.
-`token_estimate` is only `ceil(bytes / 4)`, not a real model-token count.
-Apply the selected model's tokenizer and final prompt budget before sending the
-payload.
-
-Optional vector seeds must be built through the gateway:
-
-```python
-with gateway.build_vector_index(
-    dimension=1536,
-    max_items=1000,
-    context=context,
-    entity_embedder=trusted_entity_embedder,
-) as vectors:
-    vector_tool = SessionBoundRetrievalTool(
-        gateway,
-        context=context,
-        vector_index=vectors,
-        query_embedder=trusted_query_embedder,
-    )
-    result = vector_tool.search("Find my delivery")
-```
-
-The entity embedder receives canonical JSON containing only an allowed kind
-and its policy-allowlisted properties. Raw `EphemeralVectorIndex` instances
-are rejected by the gateway; the built index is sealed to this gateway and
-exact context. AuthGraph does not provide an embedding model or load encrypted
-embeddings from Neo4j. Close the index before or when locking the session.
-Automatic vector-index cleanup is not implemented.
-
-## Configure public and private defaults
-
-The secure default is private nodes and private connections:
-
-```python
-GraphPolicy()
-```
-
-An application may configure a graph differently:
-
-```python
-from authgraph import GraphPolicy, LockedDisclosure, ProtectionLevel
-
-policy = GraphPolicy(
-    default_entity_protection=ProtectionLevel.PRIVATE,
-    default_relationship_protection=ProtectionLevel.PRIVATE,
-    allow_public_overrides=True,
-    locked_disclosure=LockedDisclosure.HIDDEN,
-)
-```
-
-`LockedDisclosure.GENERIC_BADGE` may show a fixed message that private data is
-supported. It does not reveal whether private records actually exist.
-
-Policies are copied into `LayeredGraphService` at startup. They are not stored
-in Neo4j, versioned, or audited.
-
-## Shut down safely
-
-Reuse one Neo4j driver and one broker for the application process. At shutdown:
+On application shutdown:
 
 ```python
 sessions.close_all()
 driver.close()
 ```
 
-Using the broker as a context manager also calls `close_all()`:
+## 13. Tests
 
-```python
-with InMemorySessionBroker() as sessions:
-    ...
-```
-
-The current broker is for one Python process. It does not synchronize sessions
-or revocation between application replicas.
-
-## Test without Neo4j
-
-The in-memory repositories are for tests:
-
-```python
-from authgraph import (
-    CryptoEngine,
-    InMemoryGraphRepository,
-    InMemoryPublicGraphRepository,
-    KdfParameters,
-)
-```
-
-Run all unit tests:
+Run all unit tests without Neo4j:
 
 ```bash
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
-The deliberately weak KDF helper is for tests only:
+Run the opt-in live suite only against a disposable or explicitly approved
+database:
 
-```python
-crypto = CryptoEngine(
-    KdfParameters.insecure_for_testing(),
-    allow_insecure_kdf_for_testing=True,
-)
+```bash
+AUTHGRAPH_RUN_NEO4J_TESTS=1 \
+AUTHGRAPH_TEST_NEO4J_URI=neo4j+ssc://YOUR_TEST_HOST \
+AUTHGRAPH_TEST_NEO4J_USERNAME=YOUR_TEST_USER \
+AUTHGRAPH_TEST_NEO4J_PASSWORD_FILE=/secure/path/test-password \
+AUTHGRAPH_TEST_NEO4J_DATABASE=neo4j \
+python3 -m unittest discover -s tests/integration -v
 ```
 
-Never enable that override for real vaults.
+By default the suite only verifies the schema. Allow it to install the schema
+by also setting:
 
-## Current API summary
+```bash
+AUTHGRAPH_TEST_APPLY_SCHEMA=1
+```
 
-| Object | Main operations |
-|---|---|
-| `AuthGraphService` | `create_vault`, `unlock`, `lock`, `change_passphrase`, `create_entity`, `get_entity`, `connect`, `create_relationship_bundle`, `get_neighborhood`, `get_vault_snapshot` |
-| `ScopedAuthGraphService` | `create_vault`, `create_protection_scope`, `unlock`, `unlock_with_provider`, `lock`, `change_passphrase`, `create_entity`, `get_entity`, `connect`, `get_vault_snapshot`, provider enrollment and authorization epoch |
-| `LayeredGraphService` | `get_policy`, `create_entity`, `connect`, `get_public_view`, `get_unlocked_view` |
-| `InMemorySessionBroker` | `open`, `lease`, `close`, `revoke_vault`, `purge_expired`, `close_all`, health/count properties |
-| `ScopedSessionBroker` | scoped session lifecycle and health/count properties |
-| `InMemoryOneTimeCodeBroker` | `issue`, `verify`, `consume_evidence`, `purge_expired`, `close` |
-| `ScopeGrantPolicy` | `authorize_one_time_code`, `consume`, `purge_expired`, `close` |
-| Scope-key providers | `ScopeKeyEnrollmentProvider`, `ScopeKeyReleaseProvider`; in-memory test implementation |
-| GraphRAG | `DisclosurePolicy`, `SessionVisibleGraphGateway`, `SessionBoundRetrievalTool`, `ScopedGraphViewAdapter`, `EphemeralVectorIndex` |
-| Private repositories | `Neo4jGraphRepository`, `Neo4jScopedGraphRepository`, `InMemoryGraphRepository` |
-| Public repositories | `Neo4jPublicGraphRepository`, `InMemoryPublicGraphRepository` |
+The live tests use random principals and exact vault IDs for cleanup. They
+never clear the whole database.
 
-`create_relationship_bundle()` and direct broker methods are low-level APIs
-used by AuthGraph internals. Normal applications should prefer
-`LayeredGraphService` and `AuthGraphService.unlock()`/`lock()`.
+## Advanced and legacy APIs
 
-Expected application errors all inherit from `AuthGraphError`:
+- `ScopedAuthGraphService` is the lower-level scoped-v2 private API.
+- `LegacyAuthGraphService` is the old one-key whole-vault API.
+- `LayeredGraphService` is the old v1 public/private façade.
 
-| Error | Meaning |
-|---|---|
-| `ValidationError` | Input or a configured limit is invalid |
-| `ConflictError` | A generated opaque ID could not be committed |
-| `UnlockDenied` | Unlock failed without revealing why |
-| `SessionUnavailable` | Session is invalid, expired, revoked, or mismatched |
-| `AuthorizationDenied` | The trusted application did not authorize an operation |
-| `RecordNotFound` | Record is missing or outside the authorized vault |
-| `IntegrityViolation` | Stored authenticated data or its context is inconsistent |
-| `OneTimeCodeDenied` | Code verification or evidence consumption failed generically |
-| `OneTimeCodeUnavailable` | In-memory challenge broker cannot accept work |
-| `ScopeGrantDenied` | Evidence, grant, provider release, or grant lifetime was denied |
-
-## Limits that matter
-
-- Opaque IDs: at most 256 characters
-- Entity and relationship kinds: at most 128 characters
-- One encrypted payload, including kind and wrapper metadata: at most 64 KiB
-  of JSON
-- One public properties object: at most 64 KiB of JSON
-- Neighborhood: at most 100 neighbors
-- Complete vault or layered view: at most 100 entities and 200 relationships
-  in each public/private snapshot
-- Complete encrypted snapshot: at most 256 KiB of ciphertext
-- Complete public snapshot: at most 256 KiB of semantic JSON
-- Scoped session: at most 32 independent scope keys
-- OTP: 6–10 digits, at most 10 attempts, and at most 15 minutes
-- GraphRAG hard ceilings: 100 candidates, 100 nodes, 200 connections, 4 hops,
-  256 KiB for the complete canonical result, and a 65,536 byte-based token
-  estimate
-- Temporary vector index: at most 10,000 items, 4,096 dimensions, and
-  4,000,000 total numeric values
-- Session TTL: configured by the broker and never more than 24 hours
-
-Full reads fail instead of silently returning a partial graph.
-
-## Features that do not exist yet
-
-- Authentication, user registration, account recovery, passkeys, or a
-  production MFA/identity-provider integration
-- A web API, CLI, chatbot, or email/SMS delivery adapter
-- A production KMS/HSM provider
-- An embedding model, encrypted embedding store/loader, or automatic
-  vector-index/session lifecycle
-- Persistent policy configuration or security audit logs
-- Update, delete, record reclassification, key rotation, migration, recovery,
-  or shared access
-- Multi-process session and revocation coordination
-- A tested production deployment
-
-See [CHATBOT_GRAPHRAG_DESIGN.md](CHATBOT_GRAPHRAG_DESIGN.md) for the remaining
-path and [SECURITY_MODEL.md](SECURITY_MODEL.md) for the detailed threat model.
+There is no automatic migration from v1 to v2. New applications should use
+`AuthGraph`.

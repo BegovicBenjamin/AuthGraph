@@ -116,6 +116,7 @@ class ScopedEncryptedEntityRow:
     scope_id: str
     entity_id: str
     payload: EncryptedPayload
+    record_revision: int = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,6 +127,7 @@ class ScopedEncryptedRelationshipRow:
     from_entity_id: str
     to_entity_id: str
     payload: EncryptedPayload
+    record_revision: int = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -238,6 +240,7 @@ class ScopedEntity:
     scope_id: str
     kind: str
     properties: Mapping[str, Any]
+    record_revision: int = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -250,6 +253,7 @@ class ScopedRelationship:
     to_entity_id: str
     kind: str
     properties: Mapping[str, Any]
+    record_revision: int = 1
 
 
 @dataclass(frozen=True, slots=True)

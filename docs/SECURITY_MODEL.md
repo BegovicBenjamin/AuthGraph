@@ -142,13 +142,16 @@ migration, or key rotation. The broader design is in
 
 ## Layered public graph and private overlays
 
-`LayeredGraphService` keeps the existing encrypted storage path unchanged and
-adds a physically separate public path:
+The main `AuthGraph` facade combines a physically separate public path with
+scoped-v2 private storage:
 
 ```text
 Public:   AGPublicGraph / AGPublicEntity / AG_PUBLIC_LINK
-Private:  AGVault / AGEntity / AG_LINK
+Private:  AGVault / AGProtectionScope / AGScopedEntity / AG_SCOPED_LINK
 ```
+
+`LayeredGraphService` remains available only for the legacy v1
+`AGEntity`/`AG_LINK` format.
 
 The secure defaults classify every new entity and relationship as `PRIVATE`.
 A `GraphPolicy` may select different defaults for a named graph.
@@ -183,33 +186,34 @@ get_unlocked_view()`. A name in chat must never select the authorization scope.
 
 The public repository accepts trusted backend writes without a vault password
 because common application knowledge may not belong to one person. This is not
-end-user authorization. `LayeredGraphService` additionally requires an
+end-user authorization. `AuthGraph` additionally requires an
 application publisher context accepted by `public_write_authorizer`; `graph_id`
 is scope, not authorization or a secret. A web adapter must enforce its own
 administrator/data-owner policy and must not expose publisher contexts or
 public/private generic writes as AI tools.
 
-Classification is immutable in the current layered prototype. An existing
-private record cannot be exposed merely by changing metadata, and missing or
-malformed encryption fields are never interpreted as public. A future
+Classification remains immutable. Private kind and property updates keep the
+same encrypted scope; they do not reclassify the record. An existing private
+record cannot be exposed merely by changing metadata, and missing or malformed
+encryption fields are never interpreted as public. A future
 private-to-public operation must decrypt and copy in one authenticated,
 auditable, atomic transaction with explicit confirmation. Publication may
 leave plaintext in clients, logs, transaction history, caches, and backups.
 A future public-to-private operation protects only future access and cannot
 recall those copies.
 
-The layered composer uses a bounded full-vault snapshot because the requested
-test behavior gives the chatbot all of one owner's data after unlock. That
-snapshot is decrypted before layered records are filtered by `graph_id`, so
-unrelated records enter trusted transient memory and count toward the limits.
-Prefer one layered graph per vault in this prototype. Production retrieval
-should ordinarily remain task-specific and return fewer fields.
+The main facade requests a bounded snapshot through the current scoped
+session, so ciphertext outside its granted scopes cannot be decrypted. Private
+wrappers are then filtered by their encrypted `graph_id`. Records from another
+logical graph in the same granted scopes can therefore enter trusted transient
+memory and count toward the limit, but they are not returned. A relationship
+is visible only when its own scope and both endpoint scopes are present.
+Production retrieval should ordinarily remain task-specific and return fewer
+fields.
 
-`ScopedGraphViewAdapter` is the v2 alternative. It requests a snapshot through
-the current scoped session, so ciphertext outside its granted scopes cannot be
-decrypted. It returns a relationship only when its own scope and both endpoint
-scopes are present. An optional public provider is validated separately before
-the scoped overlay is merged.
+`ScopedGraphViewAdapter` remains as a lower-level compatibility adapter for raw
+scoped records. New applications should use `AuthGraph`, which understands the
+encrypted graph wrappers and public anchors directly.
 
 Policies are in-process startup configuration, not persisted or revisioned
 security records. Changing them affects future writes and the badge only. Each
@@ -324,7 +328,12 @@ Its fixed queries also require envelope version 2, the current revision, and
 an exact server-supplied scope allowlist. Scope envelopes bind their root key
 version. Scoped entity payloads bind their scope-key version. A scoped
 relationship read or write requires the relationship scope plus both endpoint
-scopes.
+scopes. New scoped records start at record revision 1. The revision is stored
+both as operational metadata and inside authenticated ciphertext. Updates use
+compare-and-swap and keep entity scope, relationship scope, direction, and
+endpoints immutable. Entity deletion refuses every incident scoped
+relationship, including one outside the session's grant; it never uses an
+unrestricted cascade delete.
 
 The separate public adapter likewise exposes only fixed, graph-scoped query
 templates. It stores properties as canonical plaintext JSON and never queries
@@ -336,9 +345,13 @@ so a snapshot cannot pair a new relationship with an older entity collection.
 The adapter treats an exact row already present after a zero-row write or
 `IncompleteCommit` as a successful retry. If it cannot verify the exact row,
 the ambiguous error is propagated rather than silently generating another ID.
-A future HTTP/API layer still needs an idempotency key for each logical create
-request; retrying the whole service call otherwise generates a new ID. The
-schema also requires globally unique entity and relationship IDs.
+Private create methods also accept an application idempotency key. AuthGraph
+derives a stable opaque object ID with HMAC-SHA256 under the selected scope key;
+the raw idempotency key is not stored. An exact replay returns the same ID,
+while reusing the key with changed semantics, scope, endpoints, or direction
+fails. Creates without a key still generate a new random ID. Public and mixed
+anchor-edge idempotency are not implemented. The schema requires globally
+unique entity and relationship IDs.
 
 Protected writes take an explicit temporary-property lock on the vault before
 reading its envelope revision. This is required because Neo4j's default
@@ -351,14 +364,17 @@ The full-vault snapshot query takes the same lock before checking the revision,
 so cooperative writes cannot produce a torn snapshot. The lock has no durable
 semantic effect, but it is held for the transaction.
 
-The portable schema contains uniqueness constraints. Missing properties are
-not covered by uniqueness, and `IF NOT EXISTS` may be blocked by a conflicting
-same-named constraint. Deployment must verify the exact result with
-`SHOW CONSTRAINTS`, prevent all untrusted direct graph writes, and use
+The packaged portable schema contains uniqueness constraints. Missing
+properties are not covered by uniqueness, and `IF NOT EXISTS` may be hidden by
+a conflicting same-named object. `authgraph schema apply` applies only the
+packaged fixed statements and then verifies exact names, types, labels,
+properties, and online index state. `authgraph schema verify` performs the same
+read-only check. Production must prevent untrusted direct graph writes and use
 Enterprise existence/key constraints where available.
 
-These queries have recording-driver unit tests but have not yet been parsed,
-executed, or profiled here against a live Neo4j 5.7+ server.
+These queries have recording-driver unit tests and an opt-in live integration
+suite. The live suite has not completed in this workspace because the Docker
+host had no free disk space; this is still a release blocker before real data.
 
 Neo4j/Aura storage encryption, TLS, RBAC, PBAC, private networking, backups,
 and audit controls remain important defense in depth. They are not a
@@ -388,15 +404,15 @@ accepts question text. Do not register the backend
 `SessionVisibleGraphGateway.retrieve()` method directly because it also has
 trusted-only parameters.
 
-The current scoped adapter first decrypts a bounded complete snapshot of every
-scope granted to the session in trusted memory. The gateway then projects
+The current main facade first decrypts a bounded complete snapshot of every
+scope granted to the session in trusted memory and selects wrappers for the
+requested encrypted `graph_id`. The gateway then projects
 allowed kinds and properties, ranks lexical and optional vector seeds,
 performs bounded traversal, and returns provenance. This reduces model
 disclosure but is not yet repository-native targeted retrieval. Its canonical
 serialized byte limit covers the complete returned payload. Its token value is
 only a deterministic byte-based estimate; the host must apply the actual
-selected model tokenizer and final prompt budget. The adapter's `graph_id`
-labels that complete granted-scope view; it does not select private records.
+selected model tokenizer and final prompt budget.
 
 An external LLM necessarily sees those returned plaintext fields. Turning off
 "memory" does not cryptographically prove that a model provider kept no logs.
@@ -406,7 +422,7 @@ when applicable. If zero sensitive plaintext may leave the trusted boundary,
 use a local/on-premises model or deterministic output.
 
 `get_vault_snapshot()` is the deliberate bounded full-authorized-scopes
-operation used internally by the current scoped adapter and available for
+operation used internally by the current facade and available for
 small tests. It is authenticated out of band and returns either one complete
 small view or an error under fixed count and aggregate-ciphertext ceilings. It
 does not stream partial plaintext and AuthGraph does not cache its return
@@ -422,10 +438,12 @@ deletes a row or removes the label, vault metadata, or ownership edge needed
 to make that row query-visible; that requires an authenticated inventory
 outside the mutable graph.
 
-The current API has no update or delete operations, embedding model, encrypted
-embedding storage/loader, hosted model integration, or AI write path. The
-temporary vector index is caller-managed and must be closed before or with the
-secure session; automatic lifecycle binding is not implemented.
+The current private API has revision-checked update and restrictive physical
+delete operations. Public mutation after creation, encrypted embedding
+storage/loading, hosted model integration, and an AI write policy are not
+implemented. The temporary vector index is caller-managed and must be closed
+before or with the secure session; automatic lifecycle binding is not
+implemented.
 
 ## Tests required before real data
 
@@ -457,6 +475,11 @@ The included unit tests cover the first layer:
   scope visibility;
 - fixed, owner-rooted, revision-fenced scoped Neo4j queries and strict
   ciphertext decoding;
+- authenticated record revisions, optimistic update conflicts, restrictive
+  entity deletion, and relationship CRUD across all required scopes;
+- HMAC-derived private idempotent creates, exact replay, changed-intent
+  rejection, and atomic scoped helper bundles;
+- packaged schema application and exact constraint/index verification;
 - OTP attempt, expiry, resend, concurrency, evidence-forgery, and replay
   behavior;
 - fixed scope profiles, provider release, authorization-epoch invalidation,

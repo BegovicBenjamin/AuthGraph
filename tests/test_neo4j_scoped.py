@@ -118,11 +118,13 @@ def entity_record(
     scope_id: str = "scope_orders",
     key_version: object = 1,
     expected_key_version: object = 1,
+    record_revision: object = 1,
 ) -> dict[str, object]:
     return {
         "vault_id": vault_id,
         "scope_id": scope_id,
         "entity_id": entity_id,
+        "record_revision": record_revision,
         "protection_scope_key_version": expected_key_version,
         "payload_version": 2,
         "key_version": key_version,
@@ -143,11 +145,13 @@ def relationship_record(
     to_scope_id: str = "scope_profile",
     key_version: object = 1,
     expected_key_version: object = 1,
+    record_revision: object = 1,
 ) -> dict[str, object]:
     return {
         "vault_id": vault_id,
         "scope_id": scope_id,
         "relationship_id": relationship_id,
+        "record_revision": record_revision,
         "from_entity_id": from_entity_id,
         "from_scope_id": from_scope_id,
         "to_entity_id": to_entity_id,
@@ -185,7 +189,12 @@ class Neo4jScopedRepositoryTests(unittest.TestCase):
             Neo4jScopedGraphRepository._PUT_SCOPED_ENTITY,
             Neo4jScopedGraphRepository._GET_SCOPED_ENTITY,
             Neo4jScopedGraphRepository._PUT_SCOPED_RELATIONSHIP,
+            Neo4jScopedGraphRepository._PUT_SCOPED_ENTITY_RELATIONSHIP_BUNDLE,
             Neo4jScopedGraphRepository._GET_SCOPED_RELATIONSHIP,
+            Neo4jScopedGraphRepository._REPLACE_SCOPED_ENTITY,
+            Neo4jScopedGraphRepository._REPLACE_SCOPED_RELATIONSHIP,
+            Neo4jScopedGraphRepository._DELETE_SCOPED_ENTITY,
+            Neo4jScopedGraphRepository._DELETE_SCOPED_RELATIONSHIP,
             Neo4jScopedGraphRepository._GET_SCOPED_VAULT_SNAPSHOT,
         )
         for query in scoped_queries:
@@ -233,6 +242,7 @@ class Neo4jScopedRepositoryTests(unittest.TestCase):
 
         for query in (
             Neo4jScopedGraphRepository._PUT_SCOPED_RELATIONSHIP,
+            Neo4jScopedGraphRepository._PUT_SCOPED_ENTITY_RELATIONSHIP_BUNDLE,
             Neo4jScopedGraphRepository._GET_SCOPED_RELATIONSHIP,
             Neo4jScopedGraphRepository._GET_SCOPED_VAULT_SNAPSHOT,
         ):
@@ -255,6 +265,7 @@ class Neo4jScopedRepositoryTests(unittest.TestCase):
     ) -> None:
         for query in (
             Neo4jScopedGraphRepository._PUT_SCOPED_RELATIONSHIP,
+            Neo4jScopedGraphRepository._PUT_SCOPED_ENTITY_RELATIONSHIP_BUNDLE,
             Neo4jScopedGraphRepository._GET_SCOPED_RELATIONSHIP,
             Neo4jScopedGraphRepository._GET_SCOPED_VAULT_SNAPSHOT,
         ):
@@ -552,6 +563,96 @@ class Neo4jScopedRepositoryTests(unittest.TestCase):
         self.assertEqual(parameters["scope_id"], "scope_orders")
         self.assertEqual(parameters["ciphertext"], b"c" * 32)
 
+    def test_scoped_anchor_bundle_is_atomic_and_ciphertext_only(self) -> None:
+        helpers = (
+            ScopedEncryptedEntityRow(
+                vault_id=self.VAULT,
+                scope_id="scope_orders",
+                entity_id="scoped_anchor_1",
+                payload=payload(),
+            ),
+            ScopedEncryptedEntityRow(
+                vault_id=self.VAULT,
+                scope_id="scope_orders",
+                entity_id="scoped_anchor_2",
+                payload=payload(),
+            ),
+        )
+        relationship = ScopedEncryptedRelationshipRow(
+            vault_id=self.VAULT,
+            scope_id="scope_orders",
+            relationship_id="scoped_relationship_1",
+            from_entity_id="scoped_anchor_1",
+            to_entity_id="scoped_anchor_2",
+            payload=payload(),
+        )
+        repository, driver = self.repository(
+            [[{"created_entities": 2, "created_relationships": 1}]]
+        )
+        self.assertTrue(
+            repository.put_scoped_entity_relationship_bundle(
+                self.PRINCIPAL,
+                self.VAULT,
+                2,
+                self.ALLOWED,
+                helpers,
+                relationship,
+            )
+        )
+        query, kwargs = driver.calls[0]
+        self.assertEqual(
+            query,
+            Neo4jScopedGraphRepository
+            ._PUT_SCOPED_ENTITY_RELATIONSHIP_BUNDLE,
+        )
+        parameters = kwargs["parameters_"]
+        self.assertEqual(parameters["allowed_scope_ids"], list(self.ALLOWED))
+        self.assertEqual(parameters["relationship_record_revision"], 1)
+        self.assertEqual(
+            {row["entity_id"] for row in parameters["entity_rows"]},
+            {"scoped_anchor_1", "scoped_anchor_2"},
+        )
+        self.assertNotIn("kind", repr(parameters))
+        self.assertNotIn("properties", repr(parameters))
+
+    def test_scoped_anchor_bundle_reconciles_only_exact_complete_state(
+        self,
+    ) -> None:
+        helpers = (
+            ScopedEncryptedEntityRow(
+                vault_id=self.VAULT,
+                scope_id="scope_orders",
+                entity_id="scoped_anchor_1",
+                payload=payload(),
+            ),
+        )
+        relationship = ScopedEncryptedRelationshipRow(
+            vault_id=self.VAULT,
+            scope_id="scope_orders",
+            relationship_id="scoped_relationship_1",
+            from_entity_id="scoped_anchor_1",
+            to_entity_id="scoped_entity_2",
+            payload=payload(),
+        )
+        stored_anchor = entity_record("scoped_anchor_1")
+        repository, _ = self.repository(
+            [
+                [{"created_entities": 0, "created_relationships": 0}],
+                [stored_anchor],
+                [relationship_record(from_entity_id="scoped_anchor_1")],
+            ]
+        )
+        self.assertTrue(
+            repository.put_scoped_entity_relationship_bundle(
+                self.PRINCIPAL,
+                self.VAULT,
+                2,
+                self.ALLOWED,
+                helpers,
+                relationship,
+            )
+        )
+
     def test_zero_row_relationship_retry_accepts_only_exact_ciphertext(
         self,
     ) -> None:
@@ -800,6 +901,185 @@ class Neo4jScopedRepositoryTests(unittest.TestCase):
                 1,
                 (["not_hashable"],),  # type: ignore[arg-type]
                 "scoped_entity_1",
+            )
+        )
+        self.assertEqual(driver.calls, [])
+
+    def test_get_relationship_discovers_endpoints_inside_fixed_query(
+        self,
+    ) -> None:
+        expected = ScopedEncryptedRelationshipRow(
+            vault_id=self.VAULT,
+            scope_id="scope_orders",
+            relationship_id="scoped_relationship_1",
+            from_entity_id="scoped_entity_1",
+            to_entity_id="scoped_entity_2",
+            payload=payload(),
+        )
+        repository, driver = self.repository([[relationship_record()]])
+
+        self.assertEqual(
+            repository.get_scoped_relationship(
+                self.PRINCIPAL,
+                self.VAULT,
+                4,
+                self.ALLOWED,
+                expected.relationship_id,
+            ),
+            expected,
+        )
+        parameters = driver.calls[0][1]["parameters_"]
+        self.assertNotIn("from_entity_id", parameters)
+        self.assertNotIn("to_entity_id", parameters)
+        self.assertEqual(parameters["allowed_scope_ids"], list(self.ALLOWED))
+
+    def test_scoped_entity_replace_is_revision_cas_and_retry_safe(
+        self,
+    ) -> None:
+        updated = ScopedEncryptedEntityRow(
+            vault_id=self.VAULT,
+            scope_id="scope_orders",
+            entity_id="scoped_entity_1",
+            payload=payload(),
+            record_revision=2,
+        )
+        repository, driver = self.repository([[{"updated": 1}]])
+        self.assertTrue(
+            repository.replace_scoped_entity(
+                self.PRINCIPAL,
+                self.VAULT,
+                3,
+                self.ALLOWED,
+                1,
+                updated,
+            )
+        )
+        query, kwargs = driver.calls[0]
+        self.assertEqual(
+            query,
+            Neo4jScopedGraphRepository._REPLACE_SCOPED_ENTITY,
+        )
+        self.assertIn("coalesce(entity.record_revision, 1)", query)
+        self.assertEqual(kwargs["parameters_"]["record_revision"], 2)
+        self.assertEqual(kwargs["parameters_"]["expected_record_revision"], 1)
+
+        repository, _ = self.repository(
+            [[{"updated": 0}], [entity_record(record_revision=2)]]
+        )
+        self.assertTrue(
+            repository.replace_scoped_entity(
+                self.PRINCIPAL,
+                self.VAULT,
+                3,
+                self.ALLOWED,
+                1,
+                updated,
+            )
+        )
+
+    def test_scoped_relationship_replace_requires_all_visible_scopes(
+        self,
+    ) -> None:
+        updated = ScopedEncryptedRelationshipRow(
+            vault_id=self.VAULT,
+            scope_id="scope_orders",
+            relationship_id="scoped_relationship_1",
+            from_entity_id="scoped_entity_1",
+            to_entity_id="scoped_entity_2",
+            payload=payload(),
+            record_revision=2,
+        )
+        repository, driver = self.repository([[{"updated": 1}]])
+        self.assertTrue(
+            repository.replace_scoped_relationship(
+                self.PRINCIPAL,
+                self.VAULT,
+                3,
+                self.ALLOWED,
+                1,
+                updated,
+            )
+        )
+        query, parameters = (
+            driver.calls[0][0],
+            driver.calls[0][1]["parameters_"],
+        )
+        self.assertIn(
+            "relationship_scope.scope_id IN $allowed_scope_ids",
+            query,
+        )
+        self.assertIn("source_scope.scope_id IN $allowed_scope_ids", query)
+        self.assertIn("target_scope.scope_id IN $allowed_scope_ids", query)
+        self.assertEqual(parameters["record_revision"], 2)
+
+    def test_scoped_deletes_are_revision_fenced_and_entity_is_restrictive(
+        self,
+    ) -> None:
+        repository, driver = self.repository(
+            [[{"deleted": 1}], [{"deleted": 1}]]
+        )
+        self.assertTrue(
+            repository.delete_scoped_relationship(
+                self.PRINCIPAL,
+                self.VAULT,
+                5,
+                self.ALLOWED,
+                "scoped_relationship_1",
+                2,
+            )
+        )
+        self.assertTrue(
+            repository.delete_scoped_entity(
+                self.PRINCIPAL,
+                self.VAULT,
+                5,
+                self.ALLOWED,
+                "scoped_entity_1",
+                2,
+            )
+        )
+        relationship_query = driver.calls[0][0]
+        entity_query = driver.calls[1][0]
+        self.assertIn(
+            "coalesce(link.record_revision, 1)",
+            relationship_query,
+        )
+        self.assertIn(
+            "NOT EXISTS {\n            MATCH "
+            "(entity)-[:AG_SCOPED_LINK]-()",
+            entity_query,
+        )
+        self.assertNotIn("DETACH DELETE", entity_query)
+
+    def test_invalid_record_revisions_fail_closed(self) -> None:
+        repository, driver = self.repository([[entity_record(
+            record_revision=True
+        )]])
+        with self.assertRaises(IntegrityViolation):
+            repository.get_scoped_entity(
+                self.PRINCIPAL,
+                self.VAULT,
+                1,
+                self.ALLOWED,
+                "scoped_entity_1",
+            )
+
+        repository, driver = self.repository([])
+        invalid_update = ScopedEncryptedEntityRow(
+            vault_id=self.VAULT,
+            scope_id="scope_orders",
+            entity_id="scoped_entity_1",
+            payload=payload(),
+            record_revision=3,
+        )
+        self.assertFalse(
+            repository.replace_scoped_entity(
+                self.PRINCIPAL,
+                self.VAULT,
+                1,
+                self.ALLOWED,
+                1,
+                invalid_update,
             )
         )
         self.assertEqual(driver.calls, [])
