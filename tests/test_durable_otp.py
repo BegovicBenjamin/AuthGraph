@@ -6,6 +6,7 @@ import threading
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 from authgraph.durable_otp import DurableOneTimeCodeBroker
 from authgraph.otp import OneTimeCodeDenied, OneTimeCodeUnavailable
@@ -306,6 +307,50 @@ class DurableOneTimeCodeTests(unittest.TestCase):
         link.symlink_to(target)
         with self.assertRaises(OneTimeCodeUnavailable):
             DurableOneTimeCodeBroker(link, self.key)
+
+    def test_file_creation_race_accepts_secure_regular_winner(self) -> None:
+        def win_creation_race(*_args: object) -> None:
+            self.path.write_bytes(b"")
+            self.path.chmod(0o600)
+            raise FileExistsError
+
+        with patch(
+            "authgraph.durable_otp.os.open",
+            side_effect=win_creation_race,
+        ) as open_file:
+            broker = self.broker()
+        open_file.assert_called_once()
+        broker.close()
+
+    @unittest.skipUnless(os.name == "posix", "POSIX file modes required")
+    def test_file_creation_race_rejects_unsafe_winner(self) -> None:
+        for winner_kind in ("permissive", "symlink"):
+            with self.subTest(winner_kind=winner_kind):
+                race_path = Path(
+                    self.directory.name,
+                    f"{winner_kind}-race.sqlite3",
+                )
+
+                def win_creation_race(*_args: object) -> None:
+                    if winner_kind == "permissive":
+                        race_path.write_bytes(b"")
+                        race_path.chmod(0o644)
+                    else:
+                        target = Path(
+                            self.directory.name,
+                            "symlink-race-target.sqlite3",
+                        )
+                        target.write_bytes(b"")
+                        target.chmod(0o600)
+                        race_path.symlink_to(target)
+                    raise FileExistsError
+
+                with patch(
+                    "authgraph.durable_otp.os.open",
+                    side_effect=win_creation_race,
+                ):
+                    with self.assertRaises(OneTimeCodeUnavailable):
+                        DurableOneTimeCodeBroker(race_path, self.key)
 
     @unittest.skipUnless(os.name == "posix", "POSIX file modes required")
     def test_rejects_state_in_a_writable_untrusted_directory(self) -> None:

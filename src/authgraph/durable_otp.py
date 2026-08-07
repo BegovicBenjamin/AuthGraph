@@ -54,6 +54,7 @@ DEFAULT_ISSUE_WINDOW_SECONDS = 15 * 60
 DEFAULT_MAX_ISSUES_PER_WINDOW = 5
 MAX_ISSUE_WINDOW_SECONDS = 24 * 60 * 60
 MAX_ISSUES_PER_WINDOW = 100
+_DATABASE_INITIALIZE_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,7 +123,7 @@ class DurableOneTimeCodeBroker:
         self._prepare_database_file()
         connection: sqlite3.Connection | None = None
         try:
-            connection = self._connect()
+            connection = self._connect(configure_durability=False)
             self._initialize(connection)
         except Exception:
             self._key[:] = b"\x00" * len(self._key)
@@ -161,45 +162,65 @@ class DurableOneTimeCodeBroker:
             ):
                 raise OneTimeCodeUnavailable()
             if self._path.exists() or self._path.is_symlink():
-                metadata = self._path.lstat()
-                if (
-                    stat.S_ISLNK(metadata.st_mode)
-                    or not stat.S_ISREG(metadata.st_mode)
-                ):
-                    raise OneTimeCodeUnavailable()
-                if os.name == "posix" and (
-                    metadata.st_uid != os.geteuid()
-                    or stat.S_IMODE(metadata.st_mode) & 0o077
-                ):
-                    raise OneTimeCodeUnavailable()
+                self._validate_database_file()
                 return
             flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
             flags |= getattr(os, "O_CLOEXEC", 0)
             flags |= getattr(os, "O_NOFOLLOW", 0)
-            descriptor = os.open(self._path, flags, 0o600)
-            os.close(descriptor)
+            try:
+                descriptor = os.open(self._path, flags, 0o600)
+            except FileExistsError:
+                # A concurrent constructor may have securely won O_EXCL.
+                # Revalidate the exact path so a symlink or unsafe mode still
+                # fails closed instead of being accepted as a race winner.
+                self._validate_database_file()
+            else:
+                os.close(descriptor)
         except OneTimeCodeUnavailable:
             raise
         except OSError:
             raise OneTimeCodeUnavailable() from None
 
-    def _connect(self) -> sqlite3.Connection:
+    def _validate_database_file(self) -> None:
+        metadata = self._path.lstat()
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+            raise OneTimeCodeUnavailable()
+        if os.name == "posix" and (
+            metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(metadata.st_mode) & 0o077
+        ):
+            raise OneTimeCodeUnavailable()
+
+    def _connect(
+        self,
+        *,
+        configure_durability: bool = True,
+    ) -> sqlite3.Connection:
         connection = sqlite3.connect(
             self._path,
             timeout=self._timeout,
             isolation_level=None,
         )
-        connection.row_factory = sqlite3.Row
-        connection.execute(f"PRAGMA busy_timeout = {int(self._timeout * 1000)}")
-        connection.execute("PRAGMA foreign_keys = ON")
-        return connection
+        try:
+            connection.row_factory = sqlite3.Row
+            connection.execute(
+                f"PRAGMA busy_timeout = {int(self._timeout * 1000)}"
+            )
+            connection.execute("PRAGMA foreign_keys = ON")
+            if configure_durability:
+                connection.execute("PRAGMA synchronous = FULL")
+                synchronous = connection.execute(
+                    "PRAGMA synchronous"
+                ).fetchone()
+                if synchronous is None or int(synchronous[0]) != 2:
+                    raise OneTimeCodeUnavailable()
+            return connection
+        except BaseException:
+            connection.close()
+            raise
 
-    @staticmethod
-    def _initialize(connection: sqlite3.Connection) -> None:
-        connection.execute("PRAGMA journal_mode = WAL")
-        connection.execute("PRAGMA synchronous = FULL")
-        connection.executescript(
-            """
+    def _initialize(self, connection: sqlite3.Connection) -> None:
+        schema = """
             CREATE TABLE IF NOT EXISTS authgraph_otp_challenge (
                 challenge_digest BLOB PRIMARY KEY,
                 binding_digest BLOB NOT NULL UNIQUE,
@@ -235,8 +256,42 @@ class DurableOneTimeCodeBroker:
                 window_started_at REAL NOT NULL,
                 issue_count INTEGER NOT NULL
             );
-            """
-        )
+        """
+        deadline = time.monotonic() + self._timeout
+        with _DATABASE_INITIALIZE_LOCK:
+            while True:
+                try:
+                    mode = connection.execute(
+                        "PRAGMA journal_mode = WAL"
+                    ).fetchone()
+                    if mode is None or str(mode[0]).lower() != "wal":
+                        raise sqlite3.OperationalError(
+                            "Could not activate SQLite WAL mode."
+                        )
+                    connection.execute("PRAGMA synchronous = FULL")
+                    break
+                except sqlite3.OperationalError:
+                    if time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.01)
+            while True:
+                try:
+                    connection.execute("BEGIN IMMEDIATE")
+                    break
+                except sqlite3.OperationalError:
+                    if time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.01)
+            try:
+                # ``executescript`` implicitly commits, so execute each fixed
+                # DDL statement inside the serialized transaction instead.
+                for statement in schema.split(";"):
+                    if statement.strip():
+                        connection.execute(statement)
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
 
     @contextmanager
     def _transaction(self) -> Iterator[sqlite3.Connection]:

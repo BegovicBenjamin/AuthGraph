@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import multiprocessing
 import tempfile
+import threading
+import time
 import unittest
+from collections.abc import Callable
 from pathlib import Path
 
 from authgraph.durable_grants import DurableScopeGrantPolicy
@@ -18,6 +21,58 @@ from authgraph.otp import OneTimeCodeDenied
 from authgraph.scoped_sessions import ScopeKeyMaterial
 from authgraph.sqlite_key_slots import SqliteKeySlotStore
 from authgraph.unlock_policy import ScopeGrantDenied, UnlockProfile
+
+
+def _await_constructor_start(start: object, results: object) -> None:
+    results.put("ready")
+    if not start.wait(10):
+        raise RuntimeError("Timed out waiting to start constructor race.")
+
+
+def _otp_constructor_worker(
+    path: str,
+    key: bytes,
+    start: object,
+    results: object,
+) -> None:
+    _await_constructor_start(start, results)
+    broker = DurableOneTimeCodeBroker(path, key, ttl_seconds=600)
+    try:
+        results.put("constructed")
+    finally:
+        broker.close()
+
+
+def _grant_constructor_worker(
+    path: str,
+    key: bytes,
+    start: object,
+    results: object,
+) -> None:
+    profiles = {
+        "support": UnlockProfile(
+            profile_id="support",
+            scope_ids=("scope-orders",),
+            session_ttl_seconds=300,
+            allow_one_time_code=True,
+        )
+    }
+    _await_constructor_start(start, results)
+    policy = DurableScopeGrantPolicy(profiles, path, key)
+    try:
+        results.put("constructed")
+    finally:
+        policy.close()
+
+
+def _key_slot_constructor_worker(
+    path: str,
+    start: object,
+    results: object,
+) -> None:
+    _await_constructor_start(start, results)
+    SqliteKeySlotStore(path)
+    results.put("constructed")
 
 
 def _otp_verify_worker(
@@ -141,6 +196,105 @@ def _session_logout_worker(
         backend.close()
 
 
+class SqliteThreadedInitializationTests(unittest.TestCase):
+    _WORKER_COUNT = 8
+
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+
+    def tearDown(self) -> None:
+        self.directory.cleanup()
+
+    def _secure_empty_database(self, name: str) -> str:
+        path = Path(self.directory.name, name)
+        path.write_bytes(b"")
+        path.chmod(0o600)
+        return str(path)
+
+    def _constructor_race(self, construct: Callable[[], None]) -> None:
+        barrier = threading.Barrier(self._WORKER_COUNT + 1, timeout=10)
+        outcomes: list[BaseException | None] = []
+        outcomes_lock = threading.Lock()
+
+        def worker() -> None:
+            try:
+                barrier.wait()
+                construct()
+            except BaseException as error:
+                outcome = error
+            else:
+                outcome = None
+            with outcomes_lock:
+                outcomes.append(outcome)
+
+        threads = [
+            threading.Thread(target=worker, daemon=True)
+            for _ in range(self._WORKER_COUNT)
+        ]
+        for thread in threads:
+            thread.start()
+        barrier.wait()
+        deadline = time.monotonic() + 20
+        for thread in threads:
+            thread.join(max(0.0, deadline - time.monotonic()))
+
+        self.assertEqual(
+            [thread.name for thread in threads if thread.is_alive()],
+            [],
+        )
+        self.assertEqual(len(outcomes), self._WORKER_COUNT)
+        self.assertEqual(
+            [repr(outcome) for outcome in outcomes if outcome is not None],
+            [],
+        )
+
+    def test_otp_initializes_secure_empty_database_across_threads(self) -> None:
+        path = self._secure_empty_database("threaded-otp.sqlite3")
+
+        def construct() -> None:
+            broker = DurableOneTimeCodeBroker(
+                path,
+                b"o" * 32,
+                ttl_seconds=600,
+                busy_timeout_seconds=2,
+            )
+            broker.close()
+
+        self._constructor_race(construct)
+
+    def test_grants_initialize_secure_empty_database_across_threads(self) -> None:
+        path = self._secure_empty_database("threaded-grants.sqlite3")
+        profiles = {
+            "support": UnlockProfile(
+                profile_id="support",
+                scope_ids=("scope-orders",),
+                session_ttl_seconds=300,
+                allow_one_time_code=True,
+            )
+        }
+
+        def construct() -> None:
+            policy = DurableScopeGrantPolicy(
+                profiles,
+                path,
+                b"g" * 32,
+                busy_timeout_seconds=2,
+            )
+            policy.close()
+
+        self._constructor_race(construct)
+
+    def test_key_slots_initialize_secure_empty_database_across_threads(
+        self,
+    ) -> None:
+        path = self._secure_empty_database("threaded-slots.sqlite3")
+
+        def construct() -> None:
+            SqliteKeySlotStore(path, busy_timeout_seconds=2)
+
+        self._constructor_race(construct)
+
+
 class SqliteMultiprocessTests(unittest.TestCase):
     def setUp(self) -> None:
         self.directory = tempfile.TemporaryDirectory()
@@ -178,6 +332,57 @@ class SqliteMultiprocessTests(unittest.TestCase):
             worker.join(20)
             self.assertEqual(worker.exitcode, 0)
         return outcomes
+
+    def _constructor_race(
+        self,
+        target: object,
+        args: tuple[object, ...],
+    ) -> None:
+        context = self._context()
+        start = context.Event()
+        results = context.Queue()
+        self.queues.append(results)
+        workers = [
+            context.Process(target=target, args=(*args, start, results))
+            for _ in range(2)
+        ]
+        self.processes.extend(workers)
+        for worker in workers:
+            worker.start()
+
+        ready = [results.get(timeout=20) for _ in workers]
+        try:
+            self.assertEqual(ready, ["ready", "ready"])
+            self.assertFalse(Path(args[0]).exists())
+        finally:
+            start.set()
+
+        for worker in workers:
+            worker.join(20)
+        self.assertTrue(all(not worker.is_alive() for worker in workers))
+        self.assertEqual([worker.exitcode for worker in workers], [0, 0])
+        self.assertEqual(
+            [results.get(timeout=5) for _ in workers],
+            ["constructed", "constructed"],
+        )
+
+    def test_otp_fresh_database_construction_succeeds_across_processes(
+        self,
+    ) -> None:
+        path = str(Path(self.directory.name, "fresh-otp.sqlite3"))
+        self._constructor_race(_otp_constructor_worker, (path, b"o" * 32))
+
+    def test_grant_fresh_database_construction_succeeds_across_processes(
+        self,
+    ) -> None:
+        path = str(Path(self.directory.name, "fresh-grants.sqlite3"))
+        self._constructor_race(_grant_constructor_worker, (path, b"g" * 32))
+
+    def test_key_slot_fresh_database_construction_succeeds_across_processes(
+        self,
+    ) -> None:
+        path = str(Path(self.directory.name, "fresh-slots.sqlite3"))
+        self._constructor_race(_key_slot_constructor_worker, (path,))
 
     def test_otp_verification_has_one_winner_across_processes(self) -> None:
         path = str(Path(self.directory.name, "otp.sqlite3"))

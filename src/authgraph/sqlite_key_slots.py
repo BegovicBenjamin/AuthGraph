@@ -13,6 +13,7 @@ import os
 import sqlite3
 import stat
 import threading
+import time
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -25,6 +26,8 @@ from .key_custody import (
     KeySlotState,
     WrappedKeyBlob,
 )
+
+_DATABASE_INITIALIZE_LOCK = threading.Lock()
 
 
 class SqliteKeySlotStore:
@@ -49,11 +52,17 @@ class SqliteKeySlotStore:
         self._prepare_database_file()
         connection: sqlite3.Connection | None = None
         try:
-            connection = self._connect()
-            connection.execute("PRAGMA journal_mode = WAL")
-            connection.execute("PRAGMA synchronous = FULL")
-            connection.execute(
-                """
+            connection = self._connect(configure_durability=False)
+            self._initialize(connection)
+        except Exception:
+            raise KeyCustodyUnavailable() from None
+        finally:
+            if connection is not None:
+                connection.close()
+
+    def _initialize(self, connection: sqlite3.Connection) -> None:
+        statements = (
+            """
                 CREATE TABLE IF NOT EXISTS authgraph_key_slot (
                     principal_id TEXT NOT NULL,
                     vault_id TEXT NOT NULL,
@@ -70,19 +79,44 @@ class SqliteKeySlotStore:
                     ciphertext BLOB,
                     PRIMARY KEY (principal_id, vault_id, scope_id)
                 )
-                """
-            )
-            connection.execute(
-                """
+            """,
+            """
                 CREATE INDEX IF NOT EXISTS authgraph_key_slot_vault
                 ON authgraph_key_slot(principal_id, vault_id)
-                """
-            )
-        except Exception:
-            raise KeyCustodyUnavailable() from None
-        finally:
-            if connection is not None:
-                connection.close()
+            """,
+        )
+        deadline = time.monotonic() + self._timeout
+        with _DATABASE_INITIALIZE_LOCK:
+            while True:
+                try:
+                    mode = connection.execute(
+                        "PRAGMA journal_mode = WAL"
+                    ).fetchone()
+                    if mode is None or str(mode[0]).lower() != "wal":
+                        raise sqlite3.OperationalError(
+                            "Could not activate SQLite WAL mode."
+                        )
+                    connection.execute("PRAGMA synchronous = FULL")
+                    break
+                except sqlite3.OperationalError:
+                    if time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.01)
+            while True:
+                try:
+                    connection.execute("BEGIN IMMEDIATE")
+                    break
+                except sqlite3.OperationalError:
+                    if time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.01)
+            try:
+                for statement in statements:
+                    connection.execute(statement)
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
 
     def _prepare_database_file(self) -> None:
         try:
@@ -100,36 +134,61 @@ class SqliteKeySlotStore:
             ):
                 raise KeyCustodyUnavailable()
             if self._path.exists() or self._path.is_symlink():
-                metadata = self._path.lstat()
-                if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(
-                    metadata.st_mode
-                ):
-                    raise KeyCustodyUnavailable()
-                if os.name == "posix" and (
-                    metadata.st_uid != os.geteuid()
-                    or stat.S_IMODE(metadata.st_mode) & 0o077
-                ):
-                    raise KeyCustodyUnavailable()
+                self._validate_database_file()
                 return
             flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
             flags |= getattr(os, "O_CLOEXEC", 0)
             flags |= getattr(os, "O_NOFOLLOW", 0)
-            descriptor = os.open(self._path, flags, 0o600)
-            os.close(descriptor)
+            try:
+                descriptor = os.open(self._path, flags, 0o600)
+            except FileExistsError:
+                # A concurrent constructor may have securely won O_EXCL.
+                # Revalidate the exact path so a symlink or unsafe mode still
+                # fails closed instead of being accepted as a race winner.
+                self._validate_database_file()
+            else:
+                os.close(descriptor)
         except KeyCustodyUnavailable:
             raise
         except OSError:
             raise KeyCustodyUnavailable() from None
 
-    def _connect(self) -> sqlite3.Connection:
+    def _validate_database_file(self) -> None:
+        metadata = self._path.lstat()
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+            raise KeyCustodyUnavailable()
+        if os.name == "posix" and (
+            metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(metadata.st_mode) & 0o077
+        ):
+            raise KeyCustodyUnavailable()
+
+    def _connect(
+        self,
+        *,
+        configure_durability: bool = True,
+    ) -> sqlite3.Connection:
         connection = sqlite3.connect(
             self._path,
             timeout=self._timeout,
             isolation_level=None,
         )
-        connection.row_factory = sqlite3.Row
-        connection.execute(f"PRAGMA busy_timeout = {int(self._timeout * 1000)}")
-        return connection
+        try:
+            connection.row_factory = sqlite3.Row
+            connection.execute(
+                f"PRAGMA busy_timeout = {int(self._timeout * 1000)}"
+            )
+            if configure_durability:
+                connection.execute("PRAGMA synchronous = FULL")
+                synchronous = connection.execute(
+                    "PRAGMA synchronous"
+                ).fetchone()
+                if synchronous is None or int(synchronous[0]) != 2:
+                    raise KeyCustodyUnavailable()
+            return connection
+        except BaseException:
+            connection.close()
+            raise
 
     @staticmethod
     def _identity(

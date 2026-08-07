@@ -41,6 +41,7 @@ GRANT_TOKEN_LENGTH = 43
 GRANT_TOKEN_ALPHABET = frozenset(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
 )
+_DATABASE_INITIALIZE_LOCK = threading.Lock()
 
 
 class DurableScopeGrantPolicy:
@@ -101,7 +102,7 @@ class DurableScopeGrantPolicy:
         self._prepare_database_file()
         connection: sqlite3.Connection | None = None
         try:
-            connection = self._connect()
+            connection = self._connect(configure_durability=False)
             self._initialize(connection)
         except Exception:
             self._key[:] = b"\x00" * len(self._key)
@@ -140,43 +141,64 @@ class DurableScopeGrantPolicy:
             ):
                 raise ScopeGrantDenied()
             if self._path.exists() or self._path.is_symlink():
-                metadata = self._path.lstat()
-                if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(
-                    metadata.st_mode
-                ):
-                    raise ScopeGrantDenied()
-                if os.name == "posix" and (
-                    metadata.st_uid != os.geteuid()
-                    or stat.S_IMODE(metadata.st_mode) & 0o077
-                ):
-                    raise ScopeGrantDenied()
+                self._validate_database_file()
                 return
             flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
             flags |= getattr(os, "O_CLOEXEC", 0)
             flags |= getattr(os, "O_NOFOLLOW", 0)
-            descriptor = os.open(self._path, flags, 0o600)
-            os.close(descriptor)
+            try:
+                descriptor = os.open(self._path, flags, 0o600)
+            except FileExistsError:
+                # A concurrent constructor may have securely won O_EXCL.
+                # Revalidate the exact path so a symlink or unsafe mode still
+                # fails closed instead of being accepted as a race winner.
+                self._validate_database_file()
+            else:
+                os.close(descriptor)
         except ScopeGrantDenied:
             raise
         except OSError:
             raise ScopeGrantDenied() from None
 
-    def _connect(self) -> sqlite3.Connection:
+    def _validate_database_file(self) -> None:
+        metadata = self._path.lstat()
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+            raise ScopeGrantDenied()
+        if os.name == "posix" and (
+            metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(metadata.st_mode) & 0o077
+        ):
+            raise ScopeGrantDenied()
+
+    def _connect(
+        self,
+        *,
+        configure_durability: bool = True,
+    ) -> sqlite3.Connection:
         connection = sqlite3.connect(
             self._path,
             timeout=self._timeout,
             isolation_level=None,
         )
-        connection.row_factory = sqlite3.Row
-        connection.execute(f"PRAGMA busy_timeout = {int(self._timeout * 1000)}")
-        return connection
+        try:
+            connection.row_factory = sqlite3.Row
+            connection.execute(
+                f"PRAGMA busy_timeout = {int(self._timeout * 1000)}"
+            )
+            if configure_durability:
+                connection.execute("PRAGMA synchronous = FULL")
+                synchronous = connection.execute(
+                    "PRAGMA synchronous"
+                ).fetchone()
+                if synchronous is None or int(synchronous[0]) != 2:
+                    raise ScopeGrantDenied()
+            return connection
+        except BaseException:
+            connection.close()
+            raise
 
-    @staticmethod
-    def _initialize(connection: sqlite3.Connection) -> None:
-        connection.execute("PRAGMA journal_mode = WAL")
-        connection.execute("PRAGMA synchronous = FULL")
-        connection.executescript(
-            """
+    def _initialize(self, connection: sqlite3.Connection) -> None:
+        schema = """
             CREATE TABLE IF NOT EXISTS authgraph_scope_grant (
                 grant_digest BLOB PRIMARY KEY,
                 principal_digest BLOB NOT NULL,
@@ -194,8 +216,42 @@ class DurableScopeGrantPolicy:
             );
             CREATE INDEX IF NOT EXISTS authgraph_scope_grant_expiry
                 ON authgraph_scope_grant(expires_at);
-            """
-        )
+        """
+        deadline = time.monotonic() + self._timeout
+        with _DATABASE_INITIALIZE_LOCK:
+            while True:
+                try:
+                    mode = connection.execute(
+                        "PRAGMA journal_mode = WAL"
+                    ).fetchone()
+                    if mode is None or str(mode[0]).lower() != "wal":
+                        raise sqlite3.OperationalError(
+                            "Could not activate SQLite WAL mode."
+                        )
+                    connection.execute("PRAGMA synchronous = FULL")
+                    break
+                except sqlite3.OperationalError:
+                    if time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.01)
+            while True:
+                try:
+                    connection.execute("BEGIN IMMEDIATE")
+                    break
+                except sqlite3.OperationalError:
+                    if time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.01)
+            try:
+                # ``executescript`` implicitly commits, so execute each fixed
+                # DDL statement inside the serialized transaction instead.
+                for statement in schema.split(";"):
+                    if statement.strip():
+                        connection.execute(statement)
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
 
     @contextmanager
     def _transaction(self) -> Iterator[sqlite3.Connection]:

@@ -5,6 +5,11 @@ change APIs; every such change should be called out here.
 
 ## Unreleased
 
+### Fixed
+
+- Made simultaneous first-time initialization of the durable SQLite key-slot,
+  OTP, and scope-grant stores safe across local worker processes.
+
 ## 0.3.0 - 2026-08-06
 
 ### Added
