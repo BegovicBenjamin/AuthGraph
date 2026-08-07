@@ -2,23 +2,17 @@
 
 from __future__ import annotations
 
-import math
 import json
+import math
 import os
 import secrets
 import threading
 import time
 import unicodedata
-from contextlib import contextmanager
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass, field
-from typing import (
-    Callable,
-    ContextManager,
-    Iterator,
-    Mapping,
-    Protocol,
-    runtime_checkable,
-)
+from typing import Protocol, runtime_checkable
 
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -27,7 +21,6 @@ from .crypto import AES_KEY_BYTES, NONCE_BYTES, clear_bytearray
 from .errors import AuthGraphError, ValidationError
 from .otp import OneTimeCodeEvidence, OneTimeCodeEvidenceConsumer
 from .scoped_sessions import MAX_SCOPES_PER_SESSION, ScopeKeyMaterial
-
 
 MAX_PROFILE_TTL_SECONDS = 30 * 60
 MAX_EVIDENCE_AGE_SECONDS = 5 * 60
@@ -184,7 +177,7 @@ class ScopeKeyReleaseProvider(Protocol):
     def lease_scope_keys(
         self,
         grant: ScopeUnlockGrant,
-    ) -> ContextManager[ReleasedScopeKeys]: ...
+    ) -> AbstractContextManager[ReleasedScopeKeys]: ...
 
 
 @runtime_checkable
@@ -200,6 +193,13 @@ class ScopeKeyEnrollmentProvider(Protocol):
         root_key_version: int,
         scope_keys: Mapping[str, ScopeKeyMaterial],
     ) -> None: ...
+
+
+@runtime_checkable
+class ScopeGrantConsumer(Protocol):
+    """Trusted boundary that atomically consumes one scoped unlock grant."""
+
+    def consume(self, grant: ScopeUnlockGrant) -> ScopeUnlockGrant: ...
 
 
 @dataclass(slots=True)
@@ -616,8 +616,15 @@ class ScopeGrantPolicy:
                     consumed_evidence.challenge_id,
                     "Invalid opaque evidence identifier.",
                 )
+                authorization_context = (
+                    consumed_evidence.authorization_context
+                )
+                if authorization_context is None:
+                    raise ValidationError(
+                        "Invalid opaque authorization context."
+                    )
                 _validate_opaque_id(
-                    consumed_evidence.authorization_context,
+                    authorization_context,
                     "Invalid opaque authorization context.",
                 )
                 profile = self._profiles.get(consumed_evidence.profile_id)

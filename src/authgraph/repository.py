@@ -207,6 +207,20 @@ class ScopedGraphRepository(VaultRepository, Protocol):
         expected_record_revision: int,
     ) -> bool: ...
 
+    def delete_scoped_relationship_bundle(
+        self,
+        principal_id: str,
+        vault_id: str,
+        envelope_revision: int,
+        allowed_scope_ids: tuple[str, ...],
+        relationship_id: str,
+        expected_record_revision: int,
+        helper_entity_ids: tuple[str, ...],
+    ) -> bool:
+        """Atomically delete one relationship and its unshared helpers."""
+
+        ...
+
     def get_scoped_vault_snapshot(
         self,
         principal_id: str,
@@ -218,5 +232,26 @@ class ScopedGraphRepository(VaultRepository, Protocol):
         relationship_limit: int,
     ) -> ScopedEncryptedVaultSnapshotRow | None:
         """Return ciphertext only from granted scopes, plus overflow sentinels."""
+
+        ...
+
+    def get_scoped_targeted_snapshot(
+        self,
+        principal_id: str,
+        vault_id: str,
+        envelope_revision: int,
+        allowed_scope_ids: tuple[str, ...],
+        entity_ids: tuple[str, ...],
+        relationship_ids: tuple[str, ...],
+        *,
+        entity_limit: int,
+        relationship_limit: int,
+    ) -> ScopedEncryptedVaultSnapshotRow | None:
+        """Fetch only named rows plus granted endpoints of named relationships.
+
+        Implementations must remain owner-, revision-, and scope-fenced.  The
+        output limits include one overflow sentinel, matching the complete
+        snapshot contract.
+        """
 
         ...

@@ -14,23 +14,26 @@ The goal is simple:
 | Public nodes and connections | Available |
 | Legacy whole-vault encryption | Available as v1 |
 | Separate random keys for opaque protection scopes | Available as v2 |
-| Session holds only policy-granted scope keys | Available in one process |
+| Session holds only policy-granted scope keys | In memory; optional SQLite on one host |
 | Password unlock for selected scopes | Available |
-| Fixed OTP disclosure profiles and single-use grants | Available in memory |
+| Fixed OTP disclosure profiles and single-use grants | In memory; optional SQLite on one host |
 | Pluggable scope-key enrollment/release interface | Available |
-| Real KMS/HSM provider | Host integration required |
+| Injected-client AWS KMS wrapping backend | Available; host configuration required |
 | Email/SMS delivery | Host integration required |
+| Pseudonymous hash-chained audit sink | Local single-host reference available |
 | Bounded lexical GraphRAG and graph traversal | Available |
+| Repeated exact private ciphertext reads | Available after one full candidate-index build |
 | Per-kind property allowlists and provenance | Available |
 | Temporary in-memory vector index | Available; host-managed lifetime |
 | Encrypted embedding storage/loading and embedding model | Planned |
 | Passkey and identity-provider adapters | Planned |
-| Production web authentication, auditing, and multi-server sessions | Planned |
+| Production web authentication and multi-server authorization | Host integration required |
 
 AuthGraph keeps two formats separate. `AuthGraphService` is the legacy v1
 whole-vault format. `ScopedAuthGraphService` is v2: it gives every protection
 scope an independent random key and places only granted scope keys in a
-session. There is no v1-to-v2 migration yet.
+session. There is no automatic legacy v1 encrypted-record to scoped-v2 data
+migration yet; this is separate from Neo4j schema-version migrations.
 
 ## The trust boundary
 
@@ -190,7 +193,8 @@ digits can be guessed and do not contain enough entropy to protect stored
 data.
 
 The library implements the challenge, verifier, fixed grant policy, and key
-provider boundary in memory. The safe pattern is:
+provider boundary in memory, with optional durable SQLite references for one
+host. The safe pattern is:
 
 1. The user already has an application session.
 2. The host asks AuthGraph to begin a challenge for a fixed disclosure policy.
@@ -201,7 +205,9 @@ provider boundary in memory. The safe pattern is:
    challenge.
 6. The host application's mail adapter sends the code; AuthGraph does not.
 7. A secure form submits the code directly to the verifier.
-8. Rate limits and attempt limits are enforced and consumption is atomic.
+8. AuthGraph enforces configured issuance and verification-attempt limits, and
+   consumption is atomic. The host separately enforces per-account,
+   per-destination, per-IP, and network abuse limits.
 9. Successful verification creates broker-authenticated evidence exactly once.
 10. Policy exchanges it for a single-use scope grant.
 11. AuthGraph consumes that grant, asks the trusted KMS/key service for only
@@ -209,9 +215,11 @@ provider boundary in memory. The safe pattern is:
 
 The code authorizes key release; it does not mathematically derive the key.
 The included `InMemoryScopeKeyProvider` demonstrates a second provider wrap
-but is not production key custody. A real deployment needs a KMS/HSM adapter.
-If a key is protected only by the password envelope, an email code cannot
-decrypt it.
+but is not production key custody. `EnvelopeScopeKeyProvider` and the
+injected-client AWS KMS backend provide the custody interface; production still
+needs configured credentials and key policy plus a shared strongly consistent
+slot store for multiple hosts. If a key is protected only by the password
+envelope, an email code cannot decrypt it.
 
 Email codes are customizable but must be labeled as a lower-assurance option.
 Current NIST digital identity guidance does not accept email as an out-of-band
@@ -229,10 +237,10 @@ References:
 The decrypted graph is a virtual view in trusted memory. It is never written
 back to Neo4j as plaintext.
 
-The main `AuthGraph` facade requests a bounded complete snapshot of only the
-scopes present in the current v2 session, decrypts it in trusted memory, and
-selects the requested encrypted logical graph. `SessionVisibleGraphGateway`
-then combines:
+The default path, and the initial candidate-index build, request a bounded
+complete snapshot of only the scopes present in the current v2 session,
+decrypt it in trusted memory, and select the requested encrypted logical graph.
+`SessionVisibleGraphGateway` then combines:
 
 ```text
 allowed public records
@@ -258,12 +266,18 @@ Scope grants and session lifetime are configured separately. The token estimate
 is not a model tokenizer result; the host must enforce the selected model's
 real prompt limit before sending a payload.
 
-The gateway returns targeted lexical/vector seeds plus bounded traversal, but
-its current scoped adapter is not a targeted database query: every retrieval
-internally calls `ScopedAuthGraphService.get_vault_snapshot()` for all granted
-scopes before projection and ranking. That bounded full-snapshot method must
-not itself be registered as an AI tool. A future repository-native retriever
-should reduce plaintext handled by the trusted process as well as by the model.
+For repeated private searches, the host can call `build_candidate_index()`
+once. It keeps policy-allowlisted lexical token counts and opaque IDs/topology
+in trusted process memory. Later searches rank that session-bound index and use
+an exact, fixed Neo4j query to fetch/decrypt only selected current ciphertext
+rows and granted endpoints. A wrong context, expired session, or closed index
+fails without a public fallback.
+
+The initial build is still a complete bounded projection, candidate discovery
+can become stale, and the tokens are sensitive derivatives. The host must
+close the index with the session. `get_vault_snapshot()` must not itself be
+registered as an AI tool. Future storage-native candidate discovery should
+remove the initial full-view requirement.
 
 The adapter's `graph_id` is a logical label, not a private-record filter. The
 session's granted protection scopes are the isolation boundary.
@@ -356,20 +370,27 @@ Neo4j's current vector indexes require readable numeric vector properties:
 
 ## Session end
 
-The target is for lock, expiry, logout, revocation, or restart to clear,
-best-effort:
+AuthGraph lock, expiry, logout, or revocation blocks every future retrieval with
+the old session after the broker's revocation boundary. It clears broker-owned
+key buffers best-effort; an operation that already acquired a key lease may
+finish.
 
-- scope keys;
-- decrypted record caches;
-- temporary vector indexes;
-- pending authentication challenges; and
-- sensitive server-side conversation state.
+The host must separately clear decrypted caches, temporary vector/candidate
+indexes, sensitive conversation state, and any authentication challenge that
+its policy says should end with the session. Session close does not
+automatically cancel an OTP challenge or destroy a caller-owned index.
 
-It must also block every future retrieval with the old session.
+The default session broker provides its boundary in one process. Optional
+durable SQLite brokers coordinate processes on one host; an unexpired durable
+scoped session intentionally survives restart because its keys remain provider
+wrapped. A process restart clears ordinary process memory, but it is not a
+durable-session revocation event.
 
-Scope-key sessions and OTP state implement this single-process lifecycle.
-Temporary vector-index cleanup still belongs to the host and is therefore not
-yet an automatic guarantee.
+New retrieval is allowed only while the vault lifecycle is `ACTIVE` at the
+session's exact envelope revision. Interrupted password changes remain
+`REVISION_PENDING`; interrupted revoke, provider-rewrap, or recovery operations
+remain `BLOCKED`. Only trusted backend/operator reconciliation may clear those
+states. The AI must never receive that capability.
 
 This cannot make an external AI forget plaintext already sent to it. The model
 may repeat that plaintext from the current conversation, and the provider may
@@ -398,14 +419,14 @@ A safe write flow is:
 5. AuthGraph encrypts the node or connection before Neo4j receives it.
 6. An audit event records opaque IDs and the action, never the secret content.
 
-Revision-checked private updates and restrictive deletes exist as trusted
-backend operations. Classification changes and AI write tools are not
-implemented.
+Revision-checked public/private updates and restrictive deletes exist as
+trusted backend operations. Public writes require publisher authorization.
+Classification changes and AI write tools are not implemented.
 
 ## Internal model
 
 The first slice now implements these concepts, although production policy and
-key providers remain incomplete:
+deployment remain host responsibilities:
 
 ```text
 ProtectionScope
@@ -439,9 +460,10 @@ VisibleSubgraph
   provenance
 ```
 
-Changing a credential, scope key, key slot, or grant policy should increment a
-vault security revision and revoke old sessions. Multi-server deployments need
-shared durable revision and revocation state.
+Changing a passphrase envelope increments the vault revision through the
+fail-closed pending transition. Key-slot management blocks admission and
+revokes sessions under the vault fence. Multi-server deployments need shared
+durable lifecycle, revision, and revocation state.
 
 ## What is next
 
@@ -453,14 +475,16 @@ helper.
 
 The next work is:
 
-1. Run schema and v2 flows against a real Neo4j 5.7+ server.
-2. Add a production KMS/HSM scope-key provider and real passkey/IdP adapters.
-3. Add the host HTTP security layer, delivery adapter, rate limits, and audit
-   events.
-4. Add repository-native bounded retrieval, store embeddings encrypted per
+1. Require passing live schema and v2 flows for every supported Neo4j release
+   and exact AuthGraph commit.
+2. Configure and assess a real KMS/HSM deployment, shared multi-host
+   authorization state, and passkey/IdP adapters.
+3. Add the host HTTP security layer, delivery adapter, rate limits, and export
+   audit events to independently controlled storage.
+4. Add storage-native candidate discovery, store embeddings encrypted per
    scope, and automatically destroy temporary indexes with their sessions.
-5. Add public CRUD/idempotency, atomic batches, migration, key rotation,
-   recovery, multi-process revocation, and external anti-rollback state.
+5. Add atomic batches, legacy encrypted-data migration, complete data-key
+   rotation/recovery, multi-host revocation, and external anti-rollback state.
 6. Perform independent security and privacy review.
 
 Until that work is complete, AuthGraph remains a synthetic-data prototype

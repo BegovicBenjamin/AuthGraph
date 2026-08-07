@@ -39,7 +39,6 @@ from .service import (
     AuthGraphService,
 )
 
-
 MAX_PUBLIC_JSON_BYTES = 64 * 1024
 MAX_PUBLIC_SNAPSHOT_JSON_BYTES = 256 * 1024
 PRIVATE_ENTITY_WRAPPER_KIND = "__authgraph_layered_private_entity_v1"
@@ -643,12 +642,16 @@ class LayeredGraphService:
         entities: dict[str, LayeredEntity] = {}
         public_semantic_bytes = 0
         try:
-            for row in snapshot.entities:
-                self._validate_public_entity_row(graph_id, row)
-                if row.entity_id in entities:
+            for entity_row in snapshot.entities:
+                self._validate_public_entity_row(graph_id, entity_row)
+                if entity_row.entity_id in entities:
                     raise IntegrityViolation()
-                normalized_properties = _copy_json_properties(row.properties)
-                public_semantic_bytes += len(row.kind.encode("utf-8")) + len(
+                normalized_properties = _copy_json_properties(
+                    entity_row.properties
+                )
+                public_semantic_bytes += len(
+                    entity_row.kind.encode("utf-8")
+                ) + len(
                     json.dumps(
                         normalized_properties,
                         ensure_ascii=False,
@@ -664,9 +667,9 @@ class LayeredGraphService:
                     raise ValidationError(
                         "The complete public graph exceeds its byte limit."
                     )
-                entities[row.entity_id] = LayeredEntity(
-                    entity_id=row.entity_id,
-                    kind=row.kind,
+                entities[entity_row.entity_id] = LayeredEntity(
+                    entity_id=entity_row.entity_id,
+                    kind=entity_row.kind,
                     properties=normalized_properties,
                     protection=ProtectionLevel.PUBLIC,
                 )
@@ -674,16 +677,23 @@ class LayeredGraphService:
             raise IntegrityViolation() from None
         relationships: dict[str, LayeredRelationship] = {}
         try:
-            for row in snapshot.relationships:
-                self._validate_public_relationship_row(graph_id, row)
+            for relationship_row in snapshot.relationships:
+                self._validate_public_relationship_row(
+                    graph_id,
+                    relationship_row,
+                )
                 if (
-                    row.relationship_id in relationships
-                    or row.from_entity_id not in entities
-                    or row.to_entity_id not in entities
+                    relationship_row.relationship_id in relationships
+                    or relationship_row.from_entity_id not in entities
+                    or relationship_row.to_entity_id not in entities
                 ):
                     raise IntegrityViolation()
-                normalized_properties = _copy_json_properties(row.properties)
-                public_semantic_bytes += len(row.kind.encode("utf-8")) + len(
+                normalized_properties = _copy_json_properties(
+                    relationship_row.properties
+                )
+                public_semantic_bytes += len(
+                    relationship_row.kind.encode("utf-8")
+                ) + len(
                     json.dumps(
                         normalized_properties,
                         ensure_ascii=False,
@@ -699,13 +709,15 @@ class LayeredGraphService:
                     raise ValidationError(
                         "The complete public graph exceeds its byte limit."
                     )
-                relationships[row.relationship_id] = LayeredRelationship(
-                    relationship_id=row.relationship_id,
-                    from_entity_id=row.from_entity_id,
-                    to_entity_id=row.to_entity_id,
-                    kind=row.kind,
+                relationships[relationship_row.relationship_id] = (
+                    LayeredRelationship(
+                    relationship_id=relationship_row.relationship_id,
+                    from_entity_id=relationship_row.from_entity_id,
+                    to_entity_id=relationship_row.to_entity_id,
+                    kind=relationship_row.kind,
                     properties=normalized_properties,
                     protection=ProtectionLevel.PUBLIC,
+                )
                 )
         except (AttributeError, TypeError, ValueError):
             raise IntegrityViolation() from None
@@ -720,7 +732,12 @@ class LayeredGraphService:
         row: PublicEntityRow,
     ) -> None:
         try:
-            if not isinstance(row, PublicEntityRow) or row.graph_id != graph_id:
+            if (
+                not isinstance(row, PublicEntityRow)
+                or row.graph_id != graph_id
+                or type(row.record_revision) is not int
+                or row.record_revision <= 0
+            ):
                 raise IntegrityViolation()
             _validate_id(row.entity_id, "Invalid public entity identifier.")
             _validate_kind(row.kind)
@@ -737,6 +754,8 @@ class LayeredGraphService:
             if (
                 not isinstance(row, PublicRelationshipRow)
                 or row.graph_id != graph_id
+                or type(row.record_revision) is not int
+                or row.record_revision <= 0
             ):
                 raise IntegrityViolation()
             _validate_id(

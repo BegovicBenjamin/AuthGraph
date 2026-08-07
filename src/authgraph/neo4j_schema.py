@@ -7,9 +7,10 @@ arbitrary Cypher or a filesystem path through this API.
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
 from importlib import resources
-from typing import Any, Iterable
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -37,6 +38,7 @@ class SchemaVerificationReport:
 
     verified_constraints: int
     verified_indexes: int
+    schema_version: int
     problems: tuple[SchemaProblem, ...] = ()
 
     @property
@@ -79,7 +81,29 @@ class SchemaVerificationError(Neo4jSchemaError):
         super().__init__(message)
 
 
+class SchemaMigrationError(Neo4jSchemaError):
+    """The fixed, versioned data migration could not complete safely."""
+
+    def __init__(self, from_version: int, to_version: int) -> None:
+        self.from_version = from_version
+        self.to_version = to_version
+        super().__init__(
+            f"Could not migrate the AuthGraph schema from version "
+            f"{from_version} to {to_version}."
+        )
+
+
+CURRENT_SCHEMA_VERSION = 2
+
+
 EXPECTED_CONSTRAINTS = (
+    SchemaObject(
+        "authgraph_schema_metadata_name",
+        "NODE_PROPERTY_UNIQUENESS",
+        "NODE",
+        ("AGSchemaMetadata",),
+        ("name",),
+    ),
     SchemaObject(
         "authgraph_vault_id",
         "NODE_PROPERTY_UNIQUENESS",
@@ -200,6 +224,39 @@ _SHOW_INDEXES = """
 SHOW INDEXES
 YIELD name, type, entityType, labelsOrTypes, properties, state
 RETURN name, type, entityType, labelsOrTypes, properties, state
+"""
+
+_INITIALIZE_SCHEMA_VERSION = """
+MERGE (metadata:AGSchemaMetadata {name: 'authgraph'})
+ON CREATE SET metadata.version = 1
+RETURN metadata.version AS version
+"""
+
+_GET_SCHEMA_VERSION = """
+MATCH (metadata:AGSchemaMetadata {name: 'authgraph'})
+RETURN metadata.version AS version
+LIMIT 1
+"""
+
+_MIGRATE_V1_PUBLIC_ENTITY_REVISIONS = """
+MATCH (entity:AGPublicEntity)
+WHERE entity.record_revision IS NULL
+SET entity.record_revision = 1
+RETURN count(entity) AS updated
+"""
+
+_MIGRATE_V1_PUBLIC_RELATIONSHIP_REVISIONS = """
+MATCH ()-[link:AG_PUBLIC_LINK]->()
+WHERE link.record_revision IS NULL
+SET link.record_revision = 1
+RETURN count(link) AS updated
+"""
+
+_ADVANCE_SCHEMA_VERSION = """
+MATCH (metadata:AGSchemaMetadata {name: 'authgraph'})
+WHERE metadata.version = $from_version
+SET metadata.version = $to_version
+RETURN metadata.version AS version
 """
 
 _STATEMENT_NAME = re.compile(
@@ -351,6 +408,92 @@ def _records(result: Any) -> list[Any]:
         ) from None
 
 
+def _version_from_result(result: Any) -> int | None:
+    records = _records(result)
+    if not records:
+        return None
+    if len(records) != 1:
+        raise SchemaVerificationError(
+            message="Neo4j returned invalid AuthGraph schema metadata."
+        )
+    value = _field(records[0], "version")
+    if type(value) is not int or value <= 0:
+        raise SchemaVerificationError(
+            message="Neo4j returned invalid AuthGraph schema metadata."
+        )
+    return value
+
+
+def _read_schema_version(driver: Any, database: str) -> int | None:
+    try:
+        return _version_from_result(
+            driver.execute_query(_GET_SCHEMA_VERSION, database_=database)
+        )
+    except SchemaVerificationError:
+        raise
+    except Exception as exc:
+        raise SchemaVerificationError(
+            message="Could not inspect the AuthGraph schema version."
+        ) from exc
+
+
+def apply_migrations(driver: Any, *, database: str) -> int:
+    """Apply every fixed, crash-resumable migration to the current version."""
+
+    _validate_connection(driver, database)
+    try:
+        version = _version_from_result(
+            driver.execute_query(
+                _INITIALIZE_SCHEMA_VERSION,
+                database_=database,
+            )
+        )
+    except SchemaVerificationError as exc:
+        raise SchemaMigrationError(0, CURRENT_SCHEMA_VERSION) from exc
+    except Exception as exc:
+        raise SchemaMigrationError(0, CURRENT_SCHEMA_VERSION) from exc
+    if version is None or version > CURRENT_SCHEMA_VERSION:
+        raise SchemaMigrationError(
+            0 if version is None else version,
+            CURRENT_SCHEMA_VERSION,
+        )
+
+    while version < CURRENT_SCHEMA_VERSION:
+        if version != 1:
+            raise SchemaMigrationError(version, CURRENT_SCHEMA_VERSION)
+        try:
+            driver.execute_query(
+                _MIGRATE_V1_PUBLIC_ENTITY_REVISIONS,
+                database_=database,
+            )
+            driver.execute_query(
+                _MIGRATE_V1_PUBLIC_RELATIONSHIP_REVISIONS,
+                database_=database,
+            )
+            advanced = _version_from_result(
+                driver.execute_query(
+                    _ADVANCE_SCHEMA_VERSION,
+                    from_version=1,
+                    to_version=2,
+                    database_=database,
+                )
+            )
+        except SchemaVerificationError as exc:
+            raise SchemaMigrationError(1, 2) from exc
+        except Exception as exc:
+            raise SchemaMigrationError(1, 2) from exc
+        if advanced == 2:
+            version = 2
+            continue
+        # Another migrator may have won the compare-and-set after both
+        # idempotent backfills completed. Re-read before treating it as a
+        # conflict.
+        version = _read_schema_version(driver, database) or 0
+        if version != 2:
+            raise SchemaMigrationError(1, 2)
+    return version
+
+
 def _field(record: Any, name: str) -> Any:
     try:
         return record[name]
@@ -484,6 +627,7 @@ def verify_schema(driver: Any, *, database: str) -> SchemaVerificationReport:
         )
         constraint_records = _records(constraint_result)
         index_records = _records(index_result)
+        schema_version = _read_schema_version(driver, database)
     except SchemaVerificationError:
         raise
     except Exception as exc:
@@ -499,10 +643,23 @@ def verify_schema(driver: Any, *, database: str) -> SchemaVerificationReport:
         EXPECTED_INDEXES,
         indexes=True,
     )
+    version_problems: tuple[SchemaProblem, ...] = ()
+    if schema_version != CURRENT_SCHEMA_VERSION:
+        version_problems = (
+            SchemaProblem(
+                "authgraph_schema_version",
+                (
+                    "missing"
+                    if schema_version is None
+                    else f"expected {CURRENT_SCHEMA_VERSION}, got {schema_version}"
+                ),
+            ),
+        )
     report = SchemaVerificationReport(
         verified_constraints=verified_constraints,
         verified_indexes=verified_indexes,
-        problems=constraint_problems + index_problems,
+        schema_version=(0 if schema_version is None else schema_version),
+        problems=constraint_problems + index_problems + version_problems,
     )
     if not report.is_valid:
         raise SchemaVerificationError(report)
@@ -523,4 +680,5 @@ def apply_schema(driver: Any, *, database: str) -> SchemaVerificationReport:
             driver.execute_query(statement, database_=database)
         except Exception as exc:
             raise SchemaApplyError(match.group(1), ordinal) from exc
+    apply_migrations(driver, database=database)
     return verify_schema(driver, database=database)

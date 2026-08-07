@@ -12,7 +12,6 @@ from .crypto import AES_KEY_BYTES, NONCE_BYTES
 from .errors import IntegrityViolation, ValidationError
 from .models import ScopeKeyEnvelope
 
-
 SCOPE_ENVELOPE_VERSION = 1
 SCOPE_WRAPPING_ALGORITHM = "AES-256-GCM"
 SCOPE_DEK_CIPHERTEXT_BYTES = AES_KEY_BYTES + 16

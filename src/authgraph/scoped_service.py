@@ -5,12 +5,12 @@ from __future__ import annotations
 import base64
 import hmac
 import json
-import secrets
 import math
+import secrets
 import time
 import unicodedata
-from collections.abc import Mapping
-from typing import Any, Callable
+from collections.abc import Callable, Mapping
+from typing import Any
 
 from .crypto import CryptoEngine, clear_bytearray
 from .errors import (
@@ -18,6 +18,7 @@ from .errors import (
     ConflictError,
     IntegrityViolation,
     RecordNotFound,
+    SessionUnavailable,
     UnlockDenied,
     ValidationError,
 )
@@ -39,10 +40,10 @@ from .scoped_crypto import (
 )
 from .scoped_sessions import (
     MAX_SCOPES_PER_SESSION,
-    ScopeKeyMaterial,
     ScopedKeyLease,
-    ScopedSessionBroker,
+    ScopedSessionBrokerProtocol,
     ScopedSessionLease,
+    ScopeKeyMaterial,
 )
 from .service import (
     MAX_ID_CHARS,
@@ -53,16 +54,17 @@ from .service import (
 )
 from .unlock_policy import (
     ReleasedScopeKeys,
+    ScopeGrantConsumer,
     ScopeGrantDenied,
-    ScopeGrantPolicy,
     ScopeKeyEnrollmentProvider,
     ScopeKeyReleaseProvider,
     ScopeUnlockGrant,
 )
 
-
 SCOPED_PAYLOAD_VERSION = 2
 MAX_IDEMPOTENCY_KEY_CHARS = 256
+MAX_TARGETED_ENTITY_IDS = 1_000
+MAX_TARGETED_RELATIONSHIP_IDS = 2_000
 
 
 def _validate_opaque_id(value: str, message: str) -> None:
@@ -95,6 +97,23 @@ def _validate_scope_id(scope_id: str) -> None:
 
 def _validate_object_id(object_id: str) -> None:
     _validate_opaque_id(object_id, "Invalid opaque graph object identifier.")
+
+
+def _validate_target_ids(
+    values: object,
+    *,
+    maximum: int,
+) -> tuple[str, ...]:
+    if not isinstance(values, tuple) or len(values) > maximum:
+        raise ValidationError("Invalid targeted graph identifiers.")
+    try:
+        if len(set(values)) != len(values):
+            raise ValidationError("Invalid targeted graph identifiers.")
+    except TypeError:
+        raise ValidationError("Invalid targeted graph identifiers.") from None
+    for value in values:
+        _validate_object_id(value)
+    return values
 
 
 def _validate_kind(kind: str) -> None:
@@ -135,6 +154,7 @@ def _idempotent_object_id(
     scope_dek: bytearray,
     *,
     operation: str,
+    object_type: str | None = None,
     principal_id: str,
     vault_id: str,
     scope_id: str,
@@ -160,8 +180,15 @@ def _idempotent_object_id(
     ).encode("utf-8")
     digest = hmac.digest(scope_dek, message, "sha256")
     encoded = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
-    prefix = "entity" if operation == "create-entity" else "relationship"
-    return f"scoped_{prefix}_{encoded}"
+    if object_type is None:
+        resolved_type = (
+            "entity" if operation == "create-entity" else "relationship"
+        )
+    else:
+        resolved_type = object_type
+    if resolved_type not in {"entity", "relationship"}:
+        raise ValueError("Invalid idempotent object type.")
+    return f"scoped_{resolved_type}_{encoded}"
 
 
 def _semantic_payload(
@@ -228,7 +255,7 @@ class ScopedAuthGraphService:
         self,
         repository: ScopedGraphRepository,
         crypto: CryptoEngine,
-        sessions: ScopedSessionBroker,
+        sessions: ScopedSessionBrokerProtocol,
         *,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
@@ -521,7 +548,7 @@ class ScopedAuthGraphService:
     def unlock_with_provider(
         self,
         grant: ScopeUnlockGrant,
-        grant_policy: ScopeGrantPolicy,
+        grant_policy: ScopeGrantConsumer,
         provider: ScopeKeyReleaseProvider,
     ) -> AccessContext:
         """Consume a verified grant and open only provider-released scope keys.
@@ -531,7 +558,7 @@ class ScopedAuthGraphService:
         """
 
         if (
-            not isinstance(grant_policy, ScopeGrantPolicy)
+            not isinstance(grant_policy, ScopeGrantConsumer)
             or not isinstance(provider, ScopeKeyReleaseProvider)
         ):
             raise ScopeGrantDenied()
@@ -552,55 +579,61 @@ class ScopedAuthGraphService:
             requested_scope_ids = self._validated_scope_ids(
                 consumed.scope_ids
             )
-            with provider.lease_scope_keys(consumed) as released:
-                if (
-                    not isinstance(released, ReleasedScopeKeys)
-                    or not isinstance(released.scope_keys, Mapping)
-                ):
-                    raise ScopeGrantDenied()
-                materials = dict(released.scope_keys)
-                if set(materials) != set(requested_scope_ids):
-                    raise ScopeGrantDenied()
-                for scope_id, material in materials.items():
-                    _validate_scope_id(scope_id)
+            with self._sessions.vault_guard(
+                consumed.principal_id,
+                consumed.vault_id,
+            ) as guard:
+                with provider.lease_scope_keys(consumed) as released:
                     if (
-                        not isinstance(material, ScopeKeyMaterial)
-                        or type(material.key_version) is not int
-                        or material.key_version <= 0
-                        or not isinstance(material.dek, bytearray)
-                        or len(material.dek) != 32
+                        not isinstance(released, ReleasedScopeKeys)
+                        or not isinstance(released.scope_keys, Mapping)
                     ):
                         raise ScopeGrantDenied()
-                vault = self._repository.get_vault(
-                    consumed.principal_id,
-                    consumed.vault_id,
-                )
-                after_release = self._clock()
-                if (
-                    vault is None
-                    or vault.envelope.version != SCOPED_PAYLOAD_VERSION
-                    or released.root_key_version
-                    != vault.envelope.key_version
-                    or consumed.authorization_epoch
-                    != vault.envelope.envelope_revision
-                    or type(after_release) not in (int, float)
-                    or not math.isfinite(after_release)
-                ):
-                    raise ScopeGrantDenied()
-                remaining_seconds = math.ceil(
-                    consumed.expires_at - after_release
-                )
-                if remaining_seconds <= 0:
-                    raise ScopeGrantDenied()
-                opened_context = self._sessions.open(
-                    consumed.principal_id,
-                    consumed.vault_id,
-                    materials,
-                    envelope_revision=vault.envelope.envelope_revision,
-                    root_key_version=released.root_key_version,
-                    ttl_seconds=remaining_seconds,
-                    not_after=consumed.expires_at,
-                )
+                    materials = dict(released.scope_keys)
+                    if set(materials) != set(requested_scope_ids):
+                        raise ScopeGrantDenied()
+                    for scope_id, material in materials.items():
+                        _validate_scope_id(scope_id)
+                        if (
+                            not isinstance(material, ScopeKeyMaterial)
+                            or type(material.key_version) is not int
+                            or material.key_version <= 0
+                            or not isinstance(material.dek, bytearray)
+                            or len(material.dek) != 32
+                        ):
+                            raise ScopeGrantDenied()
+                    vault = self._repository.get_vault(
+                        consumed.principal_id,
+                        consumed.vault_id,
+                    )
+                    after_release = self._clock()
+                    if (
+                        vault is None
+                        or vault.envelope.version != SCOPED_PAYLOAD_VERSION
+                        or released.root_key_version
+                        != vault.envelope.key_version
+                        or consumed.authorization_epoch
+                        != vault.envelope.envelope_revision
+                        or type(after_release) not in (int, float)
+                        or not math.isfinite(after_release)
+                    ):
+                        raise ScopeGrantDenied()
+                    remaining_seconds = math.ceil(
+                        consumed.expires_at - after_release
+                    )
+                    if remaining_seconds <= 0:
+                        raise ScopeGrantDenied()
+                    guard.assert_active()
+                    opened_context = self._sessions.open(
+                        consumed.principal_id,
+                        consumed.vault_id,
+                        materials,
+                        envelope_revision=vault.envelope.envelope_revision,
+                        root_key_version=released.root_key_version,
+                        ttl_seconds=remaining_seconds,
+                        not_after=consumed.expires_at,
+                    )
+                guard.assert_active()
             if opened_context is None:
                 raise ScopeGrantDenied()
             return opened_context
@@ -659,29 +692,42 @@ class ScopedAuthGraphService:
                     envelope_revision=next_revision,
                     key_version=vault.envelope.key_version,
                 )
-                self._sessions.advance_envelope_revision(
+                transition = self._sessions.prepare_revision_change(
                     principal_id,
                     vault_id,
                     vault.envelope.envelope_revision,
+                    next_revision,
                 )
-                try:
-                    if not self._repository.replace_envelope(
-                        principal_id,
-                        vault_id,
-                        vault.envelope.envelope_revision,
-                        envelope,
-                    ):
-                        raise UnlockDenied()
-                    self._sessions.advance_envelope_revision(
-                        principal_id,
-                        vault_id,
-                        next_revision,
-                    )
-                except Exception:
-                    self._sessions.revoke_vault(principal_id, vault_id)
-                    raise
+                if not self._repository.replace_envelope(
+                    principal_id,
+                    vault_id,
+                    vault.envelope.envelope_revision,
+                    envelope,
+                ):
+                    raise UnlockDenied()
+                self._sessions.finalize_revision_change(transition)
             finally:
                 clear_bytearray(vault_wrapping_key)
+
+    def reconcile_passphrase_change(
+        self,
+        principal_id: str,
+        vault_id: str,
+    ) -> int:
+        """Resolve PENDING from the authoritative v2 graph envelope revision."""
+
+        _validate_principal_id(principal_id)
+        _validate_vault_id(vault_id)
+        with self._sessions.vault_guard(principal_id, vault_id):
+            vault = self._repository.get_vault(principal_id, vault_id)
+            if vault is None or vault.envelope.version != SCOPED_PAYLOAD_VERSION:
+                raise SessionUnavailable()
+            state = self._sessions.reconcile_revision_change(
+                principal_id,
+                vault_id,
+                vault.envelope.envelope_revision,
+            )
+            return state.current_revision
 
     @staticmethod
     def _require_scope(
@@ -1109,6 +1155,8 @@ class ScopedAuthGraphService:
         to_endpoint: str | int,
         kind: str,
         properties: Mapping[str, Any] | None = None,
+        *,
+        idempotency_key: str | None = None,
     ) -> tuple[str, tuple[str, ...]]:
         """Atomically create scoped helper entities and one relationship."""
 
@@ -1133,6 +1181,8 @@ class ScopedAuthGraphService:
         relationship_properties = _copy_properties(
             {} if properties is None else properties
         )
+        if idempotency_key is not None:
+            _validate_idempotency_key(idempotency_key)
 
         def validate_endpoint(endpoint: str | int) -> None:
             if isinstance(endpoint, str):
@@ -1178,10 +1228,25 @@ class ScopedAuthGraphService:
                 self._decrypt_entity(lease, row)
                 existing_scopes[endpoint] = row.scope_id
 
-            for _ in range(3):
+            attempts = 1 if idempotency_key is not None else 3
+            for _ in range(attempts):
                 new_entity_ids = tuple(
-                    f"scoped_{secrets.token_urlsafe(24)}"
-                    for _ in copied_specs
+                    (
+                        _idempotent_object_id(
+                            key.dek,
+                            operation=(
+                                f"create-relationship-bundle-entity-{index}"
+                            ),
+                            object_type="entity",
+                            principal_id=lease.principal_id,
+                            vault_id=lease.vault_id,
+                            scope_id=scope_id,
+                            idempotency_key=idempotency_key,
+                        )
+                        if idempotency_key is not None
+                        else f"scoped_{secrets.token_urlsafe(24)}"
+                    )
+                    for index, _ in enumerate(copied_specs)
                 )
 
                 def resolve_id(endpoint: str | int) -> str:
@@ -1231,7 +1296,17 @@ class ScopedAuthGraphService:
                     )
                 )
                 relationship_id = (
-                    f"scoped_{secrets.token_urlsafe(24)}"
+                    _idempotent_object_id(
+                        key.dek,
+                        operation="create-relationship-bundle",
+                        object_type="relationship",
+                        principal_id=lease.principal_id,
+                        vault_id=lease.vault_id,
+                        scope_id=scope_id,
+                        idempotency_key=idempotency_key,
+                    )
+                    if idempotency_key is not None
+                    else f"scoped_{secrets.token_urlsafe(24)}"
                 )
                 relationship_row = ScopedEncryptedRelationshipRow(
                     vault_id=lease.vault_id,
@@ -1282,6 +1357,83 @@ class ScopedAuthGraphService:
                     for endpoint in existing_scopes
                 ):
                     raise RecordNotFound()
+                if idempotency_key is not None:
+                    existing_entities = tuple(
+                        self._repository.get_scoped_entity(
+                            lease.principal_id,
+                            lease.vault_id,
+                            lease.envelope_revision,
+                            allowed_scope_ids,
+                            entity_id,
+                        )
+                        for entity_id in new_entity_ids
+                    )
+                    existing_relationship = (
+                        self._repository.get_scoped_relationship(
+                            lease.principal_id,
+                            lease.vault_id,
+                            lease.envelope_revision,
+                            allowed_scope_ids,
+                            relationship_id,
+                        )
+                    )
+                    if (
+                        any(row is None for row in existing_entities)
+                        or existing_relationship is None
+                    ):
+                        raise ConflictError(
+                            "The idempotent relationship bundle conflicted."
+                        )
+                    if (
+                        existing_relationship.scope_id != scope_id
+                        or existing_relationship.from_entity_id
+                        != from_entity_id
+                        or existing_relationship.to_entity_id != to_entity_id
+                        or existing_relationship.record_revision != 1
+                    ):
+                        raise ConflictError(
+                            "The idempotency key was already used for a "
+                            "different relationship bundle."
+                        )
+                    for candidate, existing in zip(
+                        entity_rows,
+                        existing_entities,
+                        strict=True,
+                    ):
+                        if existing is None:
+                            raise ConflictError(
+                                "The idempotent relationship bundle "
+                                "conflicted."
+                            )
+                        if (
+                            existing.scope_id != scope_id
+                            or existing.entity_id != candidate.entity_id
+                            or existing.record_revision != 1
+                            or self._decrypt_entity(lease, existing)
+                            != self._decrypt_entity(lease, candidate)
+                        ):
+                            raise ConflictError(
+                                "The idempotency key was already used for a "
+                                "different relationship bundle."
+                            )
+                    expected_relationship = self._decrypt_relationship(
+                        lease,
+                        relationship_row,
+                        from_scope_id=from_scope_id,
+                        to_scope_id=to_scope_id,
+                    )
+                    actual_relationship = self._decrypt_relationship(
+                        lease,
+                        existing_relationship,
+                        from_scope_id=from_scope_id,
+                        to_scope_id=to_scope_id,
+                    )
+                    if actual_relationship != expected_relationship:
+                        raise ConflictError(
+                            "The idempotency key was already used for a "
+                            "different relationship bundle."
+                        )
+                    return relationship_id, new_entity_ids
         raise ConflictError(
             "Could not allocate a unique scoped relationship bundle."
         )
@@ -1407,6 +1559,209 @@ class ScopedAuthGraphService:
             ):
                 raise ConflictError("The relationship delete conflicted.")
 
+    def delete_relationship_bundle(
+        self,
+        context: AccessContext,
+        relationship_id: str,
+        helper_entity_ids: tuple[str, ...],
+        *,
+        expected_revision: int,
+    ) -> None:
+        """Atomically delete a relationship and its unshared helper endpoints."""
+
+        _validate_object_id(relationship_id)
+        _validate_record_revision(expected_revision)
+        if (
+            not isinstance(helper_entity_ids, tuple)
+            or not 1 <= len(helper_entity_ids) <= 2
+            or len(set(helper_entity_ids)) != len(helper_entity_ids)
+        ):
+            raise ValidationError("Invalid relationship bundle helpers.")
+        for helper_entity_id in helper_entity_ids:
+            _validate_object_id(helper_entity_id)
+
+        with self._sessions.guarded_lease(context) as lease:
+            row, from_scope_id, to_scope_id = (
+                self._get_relationship_record(lease, relationship_id)
+            )
+            current = self._decrypt_relationship(
+                lease,
+                row,
+                from_scope_id=from_scope_id,
+                to_scope_id=to_scope_id,
+            )
+            if current.record_revision != expected_revision:
+                raise ConflictError("The relationship revision is stale.")
+            endpoint_ids = {row.from_entity_id, row.to_entity_id}
+            allowed_scope_ids = tuple(lease.scope_keys)
+            for helper_entity_id in helper_entity_ids:
+                if helper_entity_id not in endpoint_ids:
+                    raise ValidationError(
+                        "A relationship helper must be one of its endpoints."
+                    )
+                helper = self._repository.get_scoped_entity(
+                    lease.principal_id,
+                    lease.vault_id,
+                    lease.envelope_revision,
+                    allowed_scope_ids,
+                    helper_entity_id,
+                )
+                if helper is None:
+                    raise RecordNotFound()
+                if helper.scope_id != row.scope_id:
+                    raise IntegrityViolation()
+                self._decrypt_entity(lease, helper)
+            if not self._repository.delete_scoped_relationship_bundle(
+                lease.principal_id,
+                lease.vault_id,
+                lease.envelope_revision,
+                allowed_scope_ids,
+                relationship_id,
+                expected_revision,
+                helper_entity_ids,
+            ):
+                raise ConflictError(
+                    "The relationship bundle delete conflicted or a helper "
+                    "is still shared."
+                )
+
+    def get_targeted_snapshot(
+        self,
+        context: AccessContext,
+        entity_ids: tuple[str, ...],
+        relationship_ids: tuple[str, ...],
+    ) -> ScopedVaultSnapshot:
+        """Decrypt only named records and granted endpoints of named edges."""
+
+        normalized_entity_ids = _validate_target_ids(
+            entity_ids,
+            maximum=MAX_TARGETED_ENTITY_IDS,
+        )
+        normalized_relationship_ids = _validate_target_ids(
+            relationship_ids,
+            maximum=MAX_TARGETED_RELATIONSHIP_IDS,
+        )
+        expected_entity_rows = len(normalized_entity_ids) + (
+            2 * len(normalized_relationship_ids)
+        )
+        entity_limit = max(1, expected_entity_rows)
+        relationship_limit = max(1, len(normalized_relationship_ids))
+
+        with self._sessions.guarded_lease(context) as lease:
+            encrypted = self._repository.get_scoped_targeted_snapshot(
+                lease.principal_id,
+                lease.vault_id,
+                lease.envelope_revision,
+                tuple(lease.scope_keys),
+                normalized_entity_ids,
+                normalized_relationship_ids,
+                entity_limit=entity_limit,
+                relationship_limit=relationship_limit,
+            )
+            if encrypted is None:
+                raise RecordNotFound()
+            if (
+                len(encrypted.entities) > expected_entity_rows
+                or len(encrypted.relationships)
+                > len(normalized_relationship_ids)
+            ):
+                raise IntegrityViolation()
+            try:
+                ciphertext_bytes = sum(
+                    len(entity_row.payload.ciphertext)
+                    for entity_row in encrypted.entities
+                ) + sum(
+                    len(relationship_row.payload.ciphertext)
+                    for relationship_row in encrypted.relationships
+                )
+            except (AttributeError, TypeError):
+                raise IntegrityViolation() from None
+            if ciphertext_bytes > MAX_VAULT_SNAPSHOT_CIPHERTEXT_BYTES:
+                raise ValidationError(
+                    "The targeted granted-scope view does not fit within limits."
+                )
+
+            requested_entities = frozenset(normalized_entity_ids)
+            requested_relationships = frozenset(
+                normalized_relationship_ids
+            )
+            encrypted_relationships: dict[
+                str,
+                ScopedEncryptedRelationshipRow,
+            ] = {}
+            endpoint_ids: set[str] = set()
+            for encrypted_relationship in encrypted.relationships:
+                if (
+                    not isinstance(
+                        encrypted_relationship,
+                        ScopedEncryptedRelationshipRow,
+                    )
+                    or encrypted_relationship.relationship_id
+                    in encrypted_relationships
+                    or encrypted_relationship.relationship_id
+                    not in requested_relationships
+                ):
+                    raise IntegrityViolation()
+                encrypted_relationships[
+                    encrypted_relationship.relationship_id
+                ] = encrypted_relationship
+                endpoint_ids.update(
+                    (
+                        encrypted_relationship.from_entity_id,
+                        encrypted_relationship.to_entity_id,
+                    )
+                )
+
+            allowed_entity_ids = requested_entities | endpoint_ids
+            entities: dict[str, ScopedEntity] = {}
+            entity_scopes: dict[str, str] = {}
+            for encrypted_entity in encrypted.entities:
+                if (
+                    not isinstance(
+                        encrypted_entity,
+                        ScopedEncryptedEntityRow,
+                    )
+                    or encrypted_entity.entity_id in entities
+                    or encrypted_entity.entity_id not in allowed_entity_ids
+                ):
+                    raise IntegrityViolation()
+                entity = self._decrypt_entity(lease, encrypted_entity)
+                entities[entity.entity_id] = entity
+                entity_scopes[entity.entity_id] = entity.scope_id
+
+            relationships: dict[str, ScopedRelationship] = {}
+            for encrypted_relationship in encrypted_relationships.values():
+                if (
+                    encrypted_relationship.from_entity_id not in entities
+                    or encrypted_relationship.to_entity_id not in entities
+                ):
+                    raise IntegrityViolation()
+                relationship = self._decrypt_relationship(
+                    lease,
+                    encrypted_relationship,
+                    from_scope_id=entity_scopes[
+                        encrypted_relationship.from_entity_id
+                    ],
+                    to_scope_id=entity_scopes[
+                        encrypted_relationship.to_entity_id
+                    ],
+                )
+                relationships[relationship.relationship_id] = relationship
+            return ScopedVaultSnapshot(
+                entities=tuple(
+                    sorted(
+                        entities.values(),
+                        key=lambda entity: entity.entity_id,
+                    )
+                ),
+                relationships=tuple(
+                    sorted(
+                        relationships.values(),
+                        key=lambda relationship: relationship.relationship_id,
+                    )
+                ),
+            )
+
     def get_vault_snapshot(
         self,
         context: AccessContext,
@@ -1445,11 +1800,11 @@ class ScopedAuthGraphService:
                 )
             try:
                 ciphertext_bytes = sum(
-                    len(row.payload.ciphertext)
-                    for row in (
-                        *encrypted.entities,
-                        *encrypted.relationships,
-                    )
+                    len(entity_row.payload.ciphertext)
+                    for entity_row in encrypted.entities
+                ) + sum(
+                    len(relationship_row.payload.ciphertext)
+                    for relationship_row in encrypted.relationships
                 )
             except (AttributeError, TypeError):
                 raise IntegrityViolation() from None
@@ -1460,26 +1815,30 @@ class ScopedAuthGraphService:
 
             entities: dict[str, ScopedEntity] = {}
             entity_scopes: dict[str, str] = {}
-            for row in encrypted.entities:
-                if row.entity_id in entities:
+            for encrypted_entity in encrypted.entities:
+                if encrypted_entity.entity_id in entities:
                     raise IntegrityViolation()
-                entity = self._decrypt_entity(lease, row)
+                entity = self._decrypt_entity(lease, encrypted_entity)
                 entities[entity.entity_id] = entity
                 entity_scopes[entity.entity_id] = entity.scope_id
 
             relationships: dict[str, ScopedRelationship] = {}
-            for row in encrypted.relationships:
+            for encrypted_relationship in encrypted.relationships:
                 if (
-                    row.relationship_id in relationships
-                    or row.from_entity_id not in entities
-                    or row.to_entity_id not in entities
+                    encrypted_relationship.relationship_id in relationships
+                    or encrypted_relationship.from_entity_id not in entities
+                    or encrypted_relationship.to_entity_id not in entities
                 ):
                     raise IntegrityViolation()
                 relationship = self._decrypt_relationship(
                     lease,
-                    row,
-                    from_scope_id=entity_scopes[row.from_entity_id],
-                    to_scope_id=entity_scopes[row.to_entity_id],
+                    encrypted_relationship,
+                    from_scope_id=entity_scopes[
+                        encrypted_relationship.from_entity_id
+                    ],
+                    to_scope_id=entity_scopes[
+                        encrypted_relationship.to_entity_id
+                    ],
                 )
                 relationships[relationship.relationship_id] = relationship
             return ScopedVaultSnapshot(

@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=75"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "authgraph"
-version = "0.2.0"
+version = "0.3.0"
 description = "A scoped encrypted public/private knowledge graph layer for Neo4j"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -12,10 +12,52 @@ license = "MIT"
 authors = [
   { name = "Benjamin Begovic" },
 ]
+keywords = [
+  "encryption",
+  "graphrag",
+  "knowledge-graph",
+  "neo4j",
+  "security",
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Database",
+  "Topic :: Security :: Cryptography",
+]
 dependencies = [
   "cryptography>=44",
   "neo4j>=6.2,<7",
 ]
+
+[project.optional-dependencies]
+test = [
+  "coverage[toml]>=7.6,<8",
+  "pytest>=8.3,<9",
+]
+dev = [
+  "build>=1.2,<2",
+  "coverage[toml]>=7.6,<8",
+  "mypy>=1.13,<2",
+  "pip-audit>=2.7,<3",
+  "pytest>=8.3,<9",
+  "ruff>=0.9,<1",
+  "twine>=6,<7",
+]
+
+[project.urls]
+Changelog = "https://github.com/BegovicBenjamin/AuthGraph/blob/main/CHANGELOG.md"
+Homepage = "https://github.com/BegovicBenjamin/AuthGraph"
+Documentation = "https://github.com/BegovicBenjamin/AuthGraph/tree/main/docs"
+Issues = "https://github.com/BegovicBenjamin/AuthGraph/issues"
+Repository = "https://github.com/BegovicBenjamin/AuthGraph"
+Security = "https://github.com/BegovicBenjamin/AuthGraph/blob/main/SECURITY.md"
 
 [project.scripts]
 authgraph = "authgraph.cli:main"
@@ -24,4 +66,24 @@ authgraph = "authgraph.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
+"authgraph" = ["py.typed"]
 "authgraph.neo4j" = ["schema.cypher"]
+
+[tool.coverage.run]
+branch = true
+source = ["authgraph"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]

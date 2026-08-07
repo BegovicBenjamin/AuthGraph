@@ -8,6 +8,10 @@
 // conflicting pre-existing name. Production Enterprise deployments should
 // additionally require the expected properties with existence/key constraints.
 
+CREATE CONSTRAINT authgraph_schema_metadata_name IF NOT EXISTS
+FOR (metadata:AGSchemaMetadata)
+REQUIRE metadata.name IS UNIQUE;
+
 CREATE CONSTRAINT authgraph_vault_id IF NOT EXISTS
 FOR (vault:AGVault)
 REQUIRE vault.vault_id IS UNIQUE;

@@ -10,16 +10,21 @@ This is an isolated first GraphRAG slice whose cryptographic boundary depends
 on the trusted view provider. The legacy
 :class:`~authgraph.layered_service.LayeredGraphService` decrypts one bounded
 *complete vault snapshot* before filtering it by ``graph_id``. In contrast,
-:class:`~authgraph.scoped_retrieval.ScopedGraphViewAdapter` obtains a snapshot
-from :class:`~authgraph.scoped_service.ScopedAuthGraphService`, which decrypts
-only the protection scopes granted to that session. In either case this
-gateway additionally minimizes what is returned to a caller or model.
+:class:`~authgraph.scoped_retrieval.ScopedGraphViewAdapter` can either obtain a
+complete granted-scope snapshot or, with a bound candidate index, fetch only
+selected records and their endpoints. In either case this gateway additionally
+minimizes what is returned to a caller or model.
 
 ``SessionVisibleGraphGateway.build_vector_index`` creates a policy- and
 context-bound in-memory index from the same allowlisted projection used for
 retrieval. Raw ``EphemeralVectorIndex`` instances are deliberately rejected by
 the gateway. The helper does not persist embeddings or make encrypted Neo4j
 vectors searchable.
+
+``build_candidate_index`` performs one bounded, policy-projected unlocked read
+and retains only lexical tokens plus opaque topology. Subsequent searches use
+fixed targeted reads and still apply the normal projection, traversal,
+provenance, and exact output budgets to current decrypted records.
 """
 
 from __future__ import annotations
@@ -44,12 +49,10 @@ from .errors import (
     SessionUnavailable,
     ValidationError,
 )
-from .layered_service import LayeredGraphService
 from .models import (
     AccessContext,
     LayeredGraphView,
 )
-
 
 MAX_QUERY_CHARS = 8 * 1024
 HARD_MAX_CANDIDATES = 100
@@ -62,6 +65,8 @@ HARD_MAX_TOKEN_ESTIMATE = 64 * 1024
 HARD_MAX_VECTOR_ITEMS = 10_000
 HARD_MAX_VECTOR_DIMENSIONS = 4_096
 HARD_MAX_VECTOR_VALUES = 4_000_000
+HARD_MAX_CANDIDATE_ITEMS = 1_000
+HARD_MAX_CANDIDATE_RELATIONSHIPS = 2_000
 
 _MAX_ID_CHARS = 256
 _MAX_KIND_CHARS = 128
@@ -752,6 +757,232 @@ class EphemeralVectorIndex:
             self._binding_context = None
 
 
+class SessionCandidateIndex:
+    """Session-local lexical and topology index over one projected view.
+
+    The index retains allowlisted lexical tokens and opaque topology only. It
+    is sealed to the exact gateway and access context that built it, and its
+    lifecycle should match that secure session. Repeated searches use it to
+    select exact record IDs before any current ciphertext is fetched.
+    """
+
+    def __init__(
+        self,
+        *,
+        max_items: int = 1_000,
+        max_relationships: int = 2_000,
+    ) -> None:
+        _validate_bound(
+            max_items,
+            description=(
+                "Candidate index item limit exceeds the supported safety "
+                "bounds."
+            ),
+            minimum=1,
+            maximum=HARD_MAX_CANDIDATE_ITEMS,
+        )
+        _validate_bound(
+            max_relationships,
+            description=(
+                "Candidate relationship limit exceeds the supported safety "
+                "bounds."
+            ),
+            minimum=1,
+            maximum=HARD_MAX_CANDIDATE_RELATIONSHIPS,
+        )
+        self._max_items = max_items
+        self._max_relationships = max_relationships
+        self._documents: dict[str, Counter[str]] = {}
+        self._relationships: dict[str, tuple[str, str]] = {}
+        self._adjacency: dict[str, tuple[tuple[str, str], ...]] = {}
+        self._closed = False
+        self._sealed = False
+        self._gateway_binding: object | None = None
+        self._binding_context: AccessContext | None = None
+        self._lock = threading.RLock()
+
+    @property
+    def item_count(self) -> int:
+        with self._lock:
+            return len(self._documents)
+
+    @property
+    def relationship_count(self) -> int:
+        with self._lock:
+            return len(self._relationships)
+
+    @property
+    def closed(self) -> bool:
+        with self._lock:
+            return self._closed
+
+    def __enter__(self) -> SessionCandidateIndex:
+        with self._lock:
+            if self._closed:
+                raise SessionUnavailable()
+        return self
+
+    def __exit__(
+        self,
+        exc_type: object,
+        exc_value: object,
+        traceback: object,
+    ) -> None:
+        self.close()
+
+    def _add_entity(self, entity_id: str, document: str) -> None:
+        with self._lock:
+            if self._closed or self._sealed:
+                raise SessionUnavailable()
+            if entity_id in self._documents:
+                raise IntegrityViolation()
+            if len(self._documents) >= self._max_items:
+                raise ValidationError(
+                    "Visible entity count exceeds the candidate index limit."
+                )
+            self._documents[entity_id] = Counter(
+                _TOKEN_PATTERN.findall(document.casefold())
+            )
+
+    def _add_relationship(
+        self,
+        relationship_id: str,
+        from_entity_id: str,
+        to_entity_id: str,
+    ) -> None:
+        with self._lock:
+            if self._closed or self._sealed:
+                raise SessionUnavailable()
+            if (
+                relationship_id in self._relationships
+                or from_entity_id not in self._documents
+                or to_entity_id not in self._documents
+            ):
+                raise IntegrityViolation()
+            if len(self._relationships) >= self._max_relationships:
+                raise ValidationError(
+                    "Visible relationship count exceeds the candidate index "
+                    "limit."
+                )
+            self._relationships[relationship_id] = (
+                from_entity_id,
+                to_entity_id,
+            )
+
+    def _seal_for_gateway(
+        self,
+        gateway_binding: object,
+        context: AccessContext,
+    ) -> None:
+        with self._lock:
+            if self._closed:
+                raise SessionUnavailable()
+            if self._sealed:
+                raise ConflictError("The candidate index is already bound.")
+            adjacency: dict[str, list[tuple[str, str]]] = {
+                entity_id: [] for entity_id in self._documents
+            }
+            for relationship_id, endpoints in self._relationships.items():
+                from_entity_id, to_entity_id = endpoints
+                adjacency[from_entity_id].append(
+                    (relationship_id, to_entity_id)
+                )
+                if to_entity_id != from_entity_id:
+                    adjacency[to_entity_id].append(
+                        (relationship_id, from_entity_id)
+                    )
+            self._adjacency = {
+                entity_id: tuple(sorted(incident))
+                for entity_id, incident in adjacency.items()
+            }
+            self._gateway_binding = gateway_binding
+            self._binding_context = context
+            self._sealed = True
+
+    def _is_bound_to(
+        self,
+        gateway_binding: object,
+        context: AccessContext,
+    ) -> bool:
+        with self._lock:
+            return (
+                not self._closed
+                and self._sealed
+                and self._gateway_binding is gateway_binding
+                and self._binding_context == context
+            )
+
+    def _entity_ids(self) -> frozenset[str]:
+        with self._lock:
+            if self._closed:
+                raise SessionUnavailable()
+            return frozenset(self._documents)
+
+    def _lexical_scores(self, query: str) -> dict[str, int]:
+        query_tokens = Counter(_TOKEN_PATTERN.findall(query.casefold()))
+        if not query_tokens:
+            return {}
+        with self._lock:
+            if self._closed:
+                raise SessionUnavailable()
+            scores: dict[str, int] = {}
+            for entity_id, document_tokens in self._documents.items():
+                score = sum(
+                    min(query_count, document_tokens.get(token, 0))
+                    for token, query_count in query_tokens.items()
+                )
+                if score > 0:
+                    scores[entity_id] = score
+            return scores
+
+    def _target_ids(
+        self,
+        seed_entity_ids: Sequence[str],
+        *,
+        max_hops: int,
+    ) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        with self._lock:
+            if self._closed:
+                raise SessionUnavailable()
+            distances: dict[str, int] = {
+                entity_id: 0
+                for entity_id in seed_entity_ids
+                if entity_id in self._documents
+            }
+            queue = deque(distances)
+            relationship_ids: set[str] = set()
+            while queue:
+                current_id = queue.popleft()
+                current_hop = distances[current_id]
+                if current_hop >= max_hops:
+                    continue
+                for relationship_id, neighbor_id in self._adjacency.get(
+                    current_id,
+                    (),
+                ):
+                    relationship_ids.add(relationship_id)
+                    if neighbor_id not in distances:
+                        distances[neighbor_id] = current_hop + 1
+                        queue.append(neighbor_id)
+            return (
+                tuple(sorted(distances)),
+                tuple(sorted(relationship_ids)),
+            )
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            for document in self._documents.values():
+                document.clear()
+            self._documents.clear()
+            self._relationships.clear()
+            self._adjacency.clear()
+            self._gateway_binding = None
+            self._binding_context = None
+
+
 @dataclass(frozen=True, slots=True)
 class _ProjectedEntity:
     entity_id: str
@@ -839,6 +1070,20 @@ class LayeredGraphViewProvider(Protocol):
     ) -> LayeredGraphView: ...
 
 
+@runtime_checkable
+class TargetedLayeredGraphViewProvider(LayeredGraphViewProvider, Protocol):
+    """Trusted provider able to fetch an exact current unlocked graph slice."""
+
+    def get_targeted_unlocked_view(
+        self,
+        graph_id: str,
+        context: AccessContext,
+        *,
+        entity_ids: tuple[str, ...],
+        relationship_ids: tuple[str, ...],
+    ) -> LayeredGraphView: ...
+
+
 class SessionVisibleGraphGateway:
     """Retrieve a policy-filtered subgraph from one server-bound graph.
 
@@ -846,8 +1091,10 @@ class SessionVisibleGraphGateway:
     executor, not a model argument. Without it, retrieval uses the public-only
     view. With it, the provider decides the cryptographic boundary: the legacy
     layered service decrypts a bounded full-vault snapshot, while the scoped
-    adapter decrypts only the scopes granted to the session. This gateway then
-    filters, ranks, and bounds either provider's returned view.
+    adapter decrypts only the scopes granted to the session. A session-bound
+    candidate index additionally selects exact current rows before decryption.
+    This gateway then filters, ranks, and bounds either provider's returned
+    view.
     """
 
     def __init__(
@@ -880,6 +1127,7 @@ class SessionVisibleGraphGateway:
         self._policy = policy
         self._envelope_reserve = envelope_reserve
         self._vector_binding = object()
+        self._candidate_binding = object()
 
     @property
     def graph_id(self) -> str:
@@ -929,12 +1177,7 @@ class SessionVisibleGraphGateway:
                 )
             for entity_id in sorted(entities):
                 entity = entities[entity_id]
-                document = _canonical_json_bytes(
-                    {
-                        "kind": entity.kind,
-                        "properties": entity.properties,
-                    }
-                ).decode("utf-8")
+                document = self._entity_document(entity)
                 index.add(entity_id, entity_embedder(document))
             index._seal_for_gateway(self._vector_binding, context)
             return index
@@ -954,9 +1197,100 @@ class SessionVisibleGraphGateway:
                 "Vector index is not bound to this gateway and context."
             )
 
+    def build_candidate_index(
+        self,
+        *,
+        context: AccessContext,
+        max_items: int = 1_000,
+        max_relationships: int = 2_000,
+    ) -> SessionCandidateIndex:
+        """Build one sealed lexical/topology index for repeated private reads."""
+
+        if not isinstance(context, AccessContext):
+            raise TypeError("context must be an AccessContext.")
+        if not isinstance(self._layered, TargetedLayeredGraphViewProvider):
+            raise TypeError(
+                "layered must provide targeted unlocked graph views."
+            )
+        index = SessionCandidateIndex(
+            max_items=max_items,
+            max_relationships=max_relationships,
+        )
+        try:
+            view = self._layered.get_unlocked_view(
+                self._graph_id,
+                context,
+            )
+            entities, relationships = self._project_view(view)
+            if len(entities) > max_items:
+                raise ValidationError(
+                    "Visible entity count exceeds the candidate index limit."
+                )
+            if len(relationships) > max_relationships:
+                raise ValidationError(
+                    "Visible relationship count exceeds the candidate index "
+                    "limit."
+                )
+            for entity_id in sorted(entities):
+                index._add_entity(
+                    entity_id,
+                    self._entity_searchable_text(entities[entity_id]),
+                )
+            for relationship_id in sorted(relationships):
+                relationship = relationships[relationship_id]
+                index._add_relationship(
+                    relationship_id,
+                    relationship.from_entity_id,
+                    relationship.to_entity_id,
+                )
+            index._seal_for_gateway(self._candidate_binding, context)
+            return index
+        except Exception:
+            index.close()
+            raise
+
+    def _require_bound_candidate_index(
+        self,
+        candidate_index: SessionCandidateIndex,
+        context: AccessContext | None,
+    ) -> AccessContext:
+        if candidate_index.closed:
+            raise SessionUnavailable()
+        if not isinstance(context, AccessContext):
+            raise ValidationError(
+                "A candidate index requires its bound access context."
+            )
+        if not candidate_index._is_bound_to(
+            self._candidate_binding,
+            context,
+        ):
+            raise ValidationError(
+                "Candidate index is not bound to this gateway and context."
+            )
+        return context
+
     @staticmethod
     def _kind_allowed(kind: str, allowed: frozenset[str]) -> bool:
         return _WILDCARD in allowed or kind in allowed
+
+    @staticmethod
+    def _entity_document(entity: _ProjectedEntity) -> str:
+        return _canonical_json_bytes(
+            {
+                "kind": entity.kind,
+                "properties": entity.properties,
+            }
+        ).decode("utf-8")
+
+    @staticmethod
+    def _entity_searchable_text(entity: _ProjectedEntity) -> str:
+        return entity.kind + " " + json.dumps(
+            entity.properties,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
 
     @staticmethod
     def _copy_allowed_properties(
@@ -1085,17 +1419,7 @@ class SessionVisibleGraphGateway:
             return {}
         scores: dict[str, int] = {}
         for entity_id, entity in entities.items():
-            searchable = (
-                entity.kind
-                + " "
-                + json.dumps(
-                    entity.properties,
-                    ensure_ascii=False,
-                    allow_nan=False,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                )
-            )
+            searchable = cls._entity_searchable_text(entity)
             document_tokens = cls._tokens(searchable)
             score = sum(
                 min(query_count, document_tokens.get(token, 0))
@@ -1129,6 +1453,23 @@ class SessionVisibleGraphGateway:
         limits: set[RetrievalLimit],
     ) -> tuple[_Seed, ...]:
         lexical_scores = self._lexical_scores(query, entities)
+        return self._rank_seed_scores(
+            frozenset(entities),
+            lexical_scores,
+            vector_index=vector_index,
+            query_embedding=query_embedding,
+            limits=limits,
+        )
+
+    def _rank_seed_scores(
+        self,
+        entity_ids: frozenset[str],
+        lexical_scores: Mapping[str, int],
+        *,
+        vector_index: EphemeralVectorIndex | None,
+        query_embedding: Sequence[float] | None,
+        limits: set[RetrievalLimit],
+    ) -> tuple[_Seed, ...]:
         vector_scores: dict[str, float] = {}
         if vector_index is not None:
             assert query_embedding is not None
@@ -1139,10 +1480,12 @@ class SessionVisibleGraphGateway:
             vector_scores = {
                 match.entity_id: match.score
                 for match in matches
-                if match.entity_id in entities
+                if match.entity_id in entity_ids
             }
 
-        candidate_ids = set(lexical_scores) | set(vector_scores)
+        candidate_ids = (
+            set(lexical_scores) | set(vector_scores)
+        ) & entity_ids
         if len(candidate_ids) > self._policy.max_candidates:
             limits.add(RetrievalLimit.CANDIDATES)
         maximum_lexical = max(lexical_scores.values(), default=0)
@@ -1216,6 +1559,7 @@ class SessionVisibleGraphGateway:
         query: str,
         *,
         context: AccessContext | None = None,
+        candidate_index: SessionCandidateIndex | None = None,
         vector_index: EphemeralVectorIndex | None = None,
         query_embedding: Sequence[float] | None = None,
     ) -> RetrievedSubgraph:
@@ -1237,27 +1581,67 @@ class SessionVisibleGraphGateway:
         ):
             raise TypeError("vector_index must be an EphemeralVectorIndex.")
         if vector_index is not None:
-            # Fail before an unlocked view performs the current bounded
-            # full-vault decryption path.
+            # Reject unbound indexes before any unlocked provider read.
             self._require_bound_vector_index(vector_index, context)
-
-        if context is None:
-            view = self._layered.get_public_view(self._graph_id)
-        else:
-            view = self._layered.get_unlocked_view(self._graph_id, context)
-        entities, relationships = self._project_view(view)
-
         budget = _Budget(
             self._policy,
             envelope_reserve=self._envelope_reserve,
         )
-        seeds = self._rank_seeds(
-            query,
-            entities,
-            vector_index=vector_index,
-            query_embedding=query_embedding,
-            limits=budget.limits,
-        )
+        if candidate_index is not None:
+            if not isinstance(candidate_index, SessionCandidateIndex):
+                raise TypeError(
+                    "candidate_index must be a SessionCandidateIndex."
+                )
+            secure_context = self._require_bound_candidate_index(
+                candidate_index,
+                context,
+            )
+            if not isinstance(
+                self._layered,
+                TargetedLayeredGraphViewProvider,
+            ):
+                raise TypeError(
+                    "layered must provide targeted unlocked graph views."
+                )
+            indexed_seeds = self._rank_seed_scores(
+                candidate_index._entity_ids(),
+                candidate_index._lexical_scores(query),
+                vector_index=vector_index,
+                query_embedding=query_embedding,
+                limits=budget.limits,
+            )
+            entity_ids, relationship_ids = candidate_index._target_ids(
+                tuple(seed.entity_id for seed in indexed_seeds),
+                max_hops=self._policy.max_hops,
+            )
+            view = self._layered.get_targeted_unlocked_view(
+                self._graph_id,
+                secure_context,
+                entity_ids=entity_ids,
+                relationship_ids=relationship_ids,
+            )
+            entities, relationships = self._project_view(view)
+            seeds = tuple(
+                seed
+                for seed in indexed_seeds
+                if seed.entity_id in entities
+            )
+        else:
+            if context is None:
+                view = self._layered.get_public_view(self._graph_id)
+            else:
+                view = self._layered.get_unlocked_view(
+                    self._graph_id,
+                    context,
+                )
+            entities, relationships = self._project_view(view)
+            seeds = self._rank_seeds(
+                query,
+                entities,
+                vector_index=vector_index,
+                query_embedding=query_embedding,
+                limits=budget.limits,
+            )
 
         selected_entities: dict[str, RetrievedEntity] = {}
         selected_relationships: dict[str, RetrievedRelationship] = {}
@@ -1311,7 +1695,7 @@ class SessionVisibleGraphGateway:
             current_id = queue.popleft()
             current = selected_entities[current_id]
             current_hop = current.provenance.hop
-            incident = adjacency.get(current_id, ())
+            incident = adjacency.get(current_id, [])
             if current_hop >= self._policy.max_hops:
                 if any(
                     relationship.relationship_id
@@ -1402,10 +1786,11 @@ class SessionVisibleGraphGateway:
 class SessionBoundRetrievalTool:
     """Question-only model tool with all authority bound by a trusted host.
 
-    The host may bind a secure ``context`` and an optional per-session vector
-    index plus query embedder when constructing this wrapper. The model-facing
-    :meth:`search` method accepts only question text, so a model cannot select
-    a principal, vault, scope, session token, Cypher statement, or limit.
+    The host may bind a secure ``context``, a session candidate index, and an
+    optional vector index plus query embedder when constructing this wrapper.
+    The model-facing :meth:`search` method accepts only question text, so a
+    model cannot select a principal, vault, scope, session token, Cypher
+    statement, or limit.
 
     Vector-index lifecycle remains caller-owned. The trusted host must create
     it with :meth:`SessionVisibleGraphGateway.build_vector_index`, keep it
@@ -1417,6 +1802,7 @@ class SessionBoundRetrievalTool:
         gateway: SessionVisibleGraphGateway,
         *,
         context: AccessContext | None = None,
+        candidate_index: SessionCandidateIndex | None = None,
         vector_index: EphemeralVectorIndex | None = None,
         query_embedder: Callable[[str], Sequence[float]] | None = None,
     ) -> None:
@@ -1435,10 +1821,20 @@ class SessionBoundRetrievalTool:
             raise TypeError("vector_index must be an EphemeralVectorIndex.")
         if query_embedder is not None and not callable(query_embedder):
             raise TypeError("query_embedder must be callable.")
+        if candidate_index is not None:
+            if not isinstance(candidate_index, SessionCandidateIndex):
+                raise TypeError(
+                    "candidate_index must be a SessionCandidateIndex."
+                )
+            gateway._require_bound_candidate_index(
+                candidate_index,
+                context,
+            )
         if vector_index is not None:
             gateway._require_bound_vector_index(vector_index, context)
         self._gateway = gateway
         self._context = context
+        self._candidate_index = candidate_index
         self._vector_index = vector_index
         self._query_embedder = query_embedder
 
@@ -1450,12 +1846,14 @@ class SessionBoundRetrievalTool:
             return self._gateway.retrieve(
                 question,
                 context=self._context,
+                candidate_index=self._candidate_index,
             )
         assert self._query_embedder is not None
         query_embedding = self._query_embedder(question)
         return self._gateway.retrieve(
             question,
             context=self._context,
+            candidate_index=self._candidate_index,
             vector_index=self._vector_index,
             query_embedding=query_embedding,
         )

@@ -152,3 +152,87 @@ class ScopedGraphViewAdapter:
             private_overlay_included=True,
             locked_disclosure=LockedDisclosure.HIDDEN,
         )
+
+    def get_targeted_unlocked_view(
+        self,
+        graph_id: str,
+        context: AccessContext,
+        *,
+        entity_ids: tuple[str, ...],
+        relationship_ids: tuple[str, ...],
+    ) -> LayeredGraphView:
+        """Compose only selected public rows and current scoped ciphertext."""
+
+        self._require_graph(graph_id)
+        snapshot = self._protected.get_targeted_snapshot(
+            context,
+            entity_ids,
+            relationship_ids,
+        )
+        # The secure read above intentionally happens before public work, so a
+        # locked or expired capability cannot become a public-only fallback.
+        public = self.get_public_view(graph_id)
+        requested_entities = frozenset(entity_ids)
+        requested_relationships = frozenset(relationship_ids)
+        selected_public_relationships = {
+            relationship.relationship_id: relationship
+            for relationship in public.relationships
+            if relationship.relationship_id in requested_relationships
+        }
+        public_endpoint_ids = {
+            endpoint_id
+            for relationship in selected_public_relationships.values()
+            for endpoint_id in (
+                relationship.from_entity_id,
+                relationship.to_entity_id,
+            )
+        }
+        selected_public_entity_ids = requested_entities | public_endpoint_ids
+        entities = {
+            entity.entity_id: entity
+            for entity in public.entities
+            if entity.entity_id in selected_public_entity_ids
+        }
+        for entity in snapshot.entities:
+            if entity.entity_id in entities:
+                raise IntegrityViolation()
+            entities[entity.entity_id] = LayeredEntity(
+                entity_id=entity.entity_id,
+                kind=entity.kind,
+                properties=dict(entity.properties),
+                protection=ProtectionLevel.PRIVATE,
+            )
+
+        relationships = dict(selected_public_relationships)
+        for relationship in snapshot.relationships:
+            if (
+                relationship.relationship_id in relationships
+                or relationship.from_entity_id not in entities
+                or relationship.to_entity_id not in entities
+            ):
+                raise IntegrityViolation()
+            relationships[relationship.relationship_id] = LayeredRelationship(
+                relationship_id=relationship.relationship_id,
+                from_entity_id=relationship.from_entity_id,
+                to_entity_id=relationship.to_entity_id,
+                kind=relationship.kind,
+                properties=dict(relationship.properties),
+                protection=ProtectionLevel.PRIVATE,
+            )
+        return LayeredGraphView(
+            graph_id=graph_id,
+            entities=tuple(
+                sorted(
+                    entities.values(),
+                    key=lambda entity: entity.entity_id,
+                )
+            ),
+            relationships=tuple(
+                sorted(
+                    relationships.values(),
+                    key=lambda relationship: relationship.relationship_id,
+                )
+            ),
+            private_overlay_included=True,
+            locked_disclosure=LockedDisclosure.HIDDEN,
+        )

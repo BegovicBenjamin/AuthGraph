@@ -17,10 +17,10 @@ from .models import (
     EncryptedVaultSnapshotRow,
     KeyEnvelope,
     ProtectionScopeRow,
-    ScopeKeyEnvelope,
     ScopedEncryptedEntityRow,
     ScopedEncryptedRelationshipRow,
     ScopedEncryptedVaultSnapshotRow,
+    ScopeKeyEnvelope,
     VaultRow,
 )
 from .scoped_crypto import (
@@ -29,7 +29,6 @@ from .scoped_crypto import (
     SCOPE_WRAPPING_ALGORITHM,
 )
 from .scoped_sessions import MAX_SCOPES_PER_SESSION
-
 
 MAX_OPAQUE_ID_CHARS = 256
 AES_GCM_TAG_BYTES = 16
@@ -56,6 +55,18 @@ def _valid_scope_ids(scope_ids: object) -> bool:
         and all(_valid_opaque_id(scope_id) for scope_id in scope_ids)
         and len(set(scope_ids)) == len(scope_ids)
     )
+
+
+def _valid_target_ids(values: object, *, maximum: int) -> bool:
+    if not isinstance(values, tuple) or len(values) > maximum:
+        return False
+    try:
+        return (
+            all(_valid_opaque_id(value) for value in values)
+            and len(set(values)) == len(values)
+        )
+    except TypeError:
+        return False
 
 
 def _valid_scope_envelope(envelope: object) -> bool:
@@ -529,6 +540,7 @@ class InMemoryGraphRepository:
             key = (vault_id, row.entity_id)
             if (
                 vault is None
+                or not isinstance(scope, ProtectionScopeRow)
                 or not _valid_protection_scope_row(
                     scope,
                     vault_id=vault_id,
@@ -626,6 +638,7 @@ class InMemoryGraphRepository:
             )
             if (
                 vault is None
+                or not isinstance(scope, ProtectionScopeRow)
                 or not _valid_protection_scope_row(
                     scope,
                     vault_id=vault_id,
@@ -643,7 +656,8 @@ class InMemoryGraphRepository:
             if current == row:
                 return True
             if (
-                not _valid_scoped_entity_row(
+                not isinstance(current, ScopedEncryptedEntityRow)
+                or not _valid_scoped_entity_row(
                     current,
                     vault_id=vault_id,
                     expected_key_version=scope.envelope.scope_key_version,
@@ -686,7 +700,8 @@ class InMemoryGraphRepository:
                 return False
             scope = self._protection_scopes.get((vault_id, row.scope_id))
             if (
-                not _valid_protection_scope_row(
+                not isinstance(scope, ProtectionScopeRow)
+                or not _valid_protection_scope_row(
                     scope,
                     vault_id=vault_id,
                     scope_id=row.scope_id,
@@ -759,6 +774,10 @@ class InMemoryGraphRepository:
             )
             if (
                 vault is None
+                or not isinstance(
+                    relationship_scope,
+                    ProtectionScopeRow,
+                )
                 or not _valid_protection_scope_row(
                     relationship_scope,
                     vault_id=vault_id,
@@ -852,6 +871,10 @@ class InMemoryGraphRepository:
             )
             if (
                 vault is None
+                or not isinstance(
+                    relationship_scope,
+                    ProtectionScopeRow,
+                )
                 or not _valid_protection_scope_row(
                     relationship_scope,
                     vault_id=vault_id,
@@ -924,6 +947,7 @@ class InMemoryGraphRepository:
                 )
                 if (
                     row.scope_id not in allowed_scope_ids
+                    or not isinstance(scope, ProtectionScopeRow)
                     or not _valid_protection_scope_row(
                         scope,
                         vault_id=vault_id,
@@ -1009,7 +1033,13 @@ class InMemoryGraphRepository:
                 (vault_id, target.scope_id)
             )
             if (
-                not _valid_protection_scope_row(
+                not isinstance(
+                    relationship_scope,
+                    ProtectionScopeRow,
+                )
+                or not isinstance(source_scope, ProtectionScopeRow)
+                or not isinstance(target_scope, ProtectionScopeRow)
+                or not _valid_protection_scope_row(
                     relationship_scope,
                     vault_id=vault_id,
                     scope_id=row.scope_id,
@@ -1099,7 +1129,11 @@ class InMemoryGraphRepository:
                 (vault_id, row.scope_id)
             )
             if (
-                not _valid_protection_scope_row(
+                not isinstance(
+                    relationship_scope,
+                    ProtectionScopeRow,
+                )
+                or not _valid_protection_scope_row(
                     relationship_scope,
                     vault_id=vault_id,
                     scope_id=row.scope_id,
@@ -1145,6 +1179,95 @@ class InMemoryGraphRepository:
             del self._scoped_relationships[(vault_id, relationship_id)]
             return True
 
+    def delete_scoped_relationship_bundle(
+        self,
+        principal_id: str,
+        vault_id: str,
+        envelope_revision: int,
+        allowed_scope_ids: tuple[str, ...],
+        relationship_id: str,
+        expected_record_revision: int,
+        helper_entity_ids: tuple[str, ...],
+    ) -> bool:
+        if (
+            not _valid_scope_ids(allowed_scope_ids)
+            or not _valid_opaque_id(relationship_id)
+            or not _valid_record_revision(expected_record_revision)
+            or not isinstance(helper_entity_ids, tuple)
+            or not 1 <= len(helper_entity_ids) <= 2
+            or len(set(helper_entity_ids)) != len(helper_entity_ids)
+            or not all(
+                _valid_opaque_id(entity_id)
+                for entity_id in helper_entity_ids
+            )
+        ):
+            return False
+        with self._lock:
+            row = self.get_scoped_relationship(
+                principal_id,
+                vault_id,
+                envelope_revision,
+                allowed_scope_ids,
+                relationship_id,
+            )
+            if (
+                row is None
+                or row.record_revision != expected_record_revision
+                or not set(helper_entity_ids).issubset(
+                    {row.from_entity_id, row.to_entity_id}
+                )
+            ):
+                return False
+            relationship_scope = self._protection_scopes.get(
+                (vault_id, row.scope_id)
+            )
+            if (
+                not isinstance(relationship_scope, ProtectionScopeRow)
+                or not _valid_protection_scope_row(
+                    relationship_scope,
+                    vault_id=vault_id,
+                    scope_id=row.scope_id,
+                )
+            ):
+                return False
+            helpers: list[ScopedEncryptedEntityRow] = []
+            for helper_entity_id in helper_entity_ids:
+                helper = self._scoped_entities.get(
+                    (vault_id, helper_entity_id)
+                )
+                if (
+                    not isinstance(helper, ScopedEncryptedEntityRow)
+                    or helper.scope_id != row.scope_id
+                    or not _valid_scoped_entity_row(
+                        helper,
+                        vault_id=vault_id,
+                        expected_key_version=(
+                            relationship_scope.envelope.scope_key_version
+                        ),
+                    )
+                ):
+                    return False
+                helpers.append(helper)
+
+            helper_ids = frozenset(helper_entity_ids)
+            for (row_vault, stored_id), stored in (
+                self._scoped_relationships.items()
+            ):
+                if row_vault != vault_id or stored_id == relationship_id:
+                    continue
+                if not isinstance(stored, ScopedEncryptedRelationshipRow):
+                    raise IntegrityViolation()
+                if (
+                    stored.from_entity_id in helper_ids
+                    or stored.to_entity_id in helper_ids
+                ):
+                    return False
+
+            del self._scoped_relationships[(vault_id, relationship_id)]
+            for helper in helpers:
+                del self._scoped_entities[(vault_id, helper.entity_id)]
+            return True
+
     def get_scoped_vault_snapshot(
         self,
         principal_id: str,
@@ -1176,17 +1299,17 @@ class InMemoryGraphRepository:
             ):
                 return None
             visible_entities: list[ScopedEncryptedEntityRow] = []
-            for (row_vault, entity_id), row in sorted(
+            for (row_vault, entity_id), entity_row in sorted(
                 self._scoped_entities.items()
             ):
                 if row_vault != vault_id:
                     continue
-                if not isinstance(row, ScopedEncryptedEntityRow):
+                if not isinstance(entity_row, ScopedEncryptedEntityRow):
                     raise IntegrityViolation()
-                if row.scope_id not in allowed:
+                if entity_row.scope_id not in allowed:
                     continue
                 scope = self._protection_scopes.get(
-                    (vault_id, row.scope_id)
+                    (vault_id, entity_row.scope_id)
                 )
                 if scope is None:
                     continue
@@ -1194,19 +1317,19 @@ class InMemoryGraphRepository:
                     not _valid_protection_scope_row(
                         scope,
                         vault_id=vault_id,
-                        scope_id=row.scope_id,
+                        scope_id=entity_row.scope_id,
                     )
                     or not _valid_scoped_entity_row(
-                        row,
+                        entity_row,
                         vault_id=vault_id,
                         expected_key_version=(
                             scope.envelope.scope_key_version
                         ),
                     )
-                    or row.entity_id != entity_id
+                    or entity_row.entity_id != entity_id
                 ):
                     raise IntegrityViolation()
-                visible_entities.append(row)
+                visible_entities.append(entity_row)
 
             visible_entity_ids = {
                 row.entity_id for row in visible_entities
@@ -1214,21 +1337,26 @@ class InMemoryGraphRepository:
             visible_relationships: list[
                 ScopedEncryptedRelationshipRow
             ] = []
-            for (row_vault, relationship_id), row in sorted(
+            for (row_vault, relationship_id), relationship_row in sorted(
                 self._scoped_relationships.items()
             ):
                 if row_vault != vault_id:
                     continue
-                if not isinstance(row, ScopedEncryptedRelationshipRow):
+                if not isinstance(
+                    relationship_row,
+                    ScopedEncryptedRelationshipRow,
+                ):
                     raise IntegrityViolation()
                 if (
-                    row.scope_id not in allowed
-                    or row.from_entity_id not in visible_entity_ids
-                    or row.to_entity_id not in visible_entity_ids
+                    relationship_row.scope_id not in allowed
+                    or relationship_row.from_entity_id
+                    not in visible_entity_ids
+                    or relationship_row.to_entity_id
+                    not in visible_entity_ids
                 ):
                     continue
                 scope = self._protection_scopes.get(
-                    (vault_id, row.scope_id)
+                    (vault_id, relationship_row.scope_id)
                 )
                 if scope is None:
                     continue
@@ -1236,19 +1364,19 @@ class InMemoryGraphRepository:
                     not _valid_protection_scope_row(
                         scope,
                         vault_id=vault_id,
-                        scope_id=row.scope_id,
+                        scope_id=relationship_row.scope_id,
                     )
                     or not _valid_scoped_relationship_row(
-                        row,
+                        relationship_row,
                         vault_id=vault_id,
                         expected_key_version=(
                             scope.envelope.scope_key_version
                         ),
                     )
-                    or row.relationship_id != relationship_id
+                    or relationship_row.relationship_id != relationship_id
                 ):
                     raise IntegrityViolation()
-                visible_relationships.append(row)
+                visible_relationships.append(relationship_row)
 
             entities = tuple(visible_entities[: entity_limit + 1])
             relationships = tuple(
@@ -1257,6 +1385,177 @@ class InMemoryGraphRepository:
             return ScopedEncryptedVaultSnapshotRow(
                 entities=entities,
                 relationships=relationships,
+            )
+
+    def get_scoped_targeted_snapshot(
+        self,
+        principal_id: str,
+        vault_id: str,
+        envelope_revision: int,
+        allowed_scope_ids: tuple[str, ...],
+        entity_ids: tuple[str, ...],
+        relationship_ids: tuple[str, ...],
+        *,
+        entity_limit: int,
+        relationship_limit: int,
+    ) -> ScopedEncryptedVaultSnapshotRow | None:
+        if (
+            type(entity_limit) is not int
+            or entity_limit <= 0
+            or type(relationship_limit) is not int
+            or relationship_limit <= 0
+        ):
+            raise ValueError("Targeted repository limits must be positive integers.")
+        if (
+            not _valid_scope_ids(allowed_scope_ids)
+            or not _valid_target_ids(entity_ids, maximum=entity_limit)
+            or not _valid_target_ids(
+                relationship_ids,
+                maximum=relationship_limit,
+            )
+        ):
+            return None
+
+        allowed = frozenset(allowed_scope_ids)
+        requested_entities = frozenset(entity_ids)
+        requested_relationships = frozenset(relationship_ids)
+        with self._lock:
+            if (
+                self._owned_scoped_vault(
+                    principal_id,
+                    vault_id,
+                    envelope_revision,
+                )
+                is None
+            ):
+                return None
+
+            relationships: list[ScopedEncryptedRelationshipRow] = []
+            endpoint_ids: set[str] = set()
+            for relationship_id in sorted(requested_relationships):
+                relationship_row = self._scoped_relationships.get(
+                    (vault_id, relationship_id)
+                )
+                if relationship_row is None:
+                    continue
+                if not isinstance(
+                    relationship_row,
+                    ScopedEncryptedRelationshipRow,
+                ):
+                    raise IntegrityViolation()
+                source = self._scoped_entities.get(
+                    (vault_id, relationship_row.from_entity_id)
+                )
+                target = self._scoped_entities.get(
+                    (vault_id, relationship_row.to_entity_id)
+                )
+                if (
+                    relationship_row.scope_id not in allowed
+                    or not isinstance(source, ScopedEncryptedEntityRow)
+                    or not isinstance(target, ScopedEncryptedEntityRow)
+                    or source.scope_id not in allowed
+                    or target.scope_id not in allowed
+                ):
+                    continue
+                relationship_scope = self._protection_scopes.get(
+                    (vault_id, relationship_row.scope_id)
+                )
+                source_scope = self._protection_scopes.get(
+                    (vault_id, source.scope_id)
+                )
+                target_scope = self._protection_scopes.get(
+                    (vault_id, target.scope_id)
+                )
+                if (
+                    not isinstance(relationship_scope, ProtectionScopeRow)
+                    or not isinstance(source_scope, ProtectionScopeRow)
+                    or not isinstance(target_scope, ProtectionScopeRow)
+                ):
+                    continue
+                if (
+                    not _valid_protection_scope_row(
+                        relationship_scope,
+                        vault_id=vault_id,
+                        scope_id=relationship_row.scope_id,
+                    )
+                    or not _valid_protection_scope_row(
+                        source_scope,
+                        vault_id=vault_id,
+                        scope_id=source.scope_id,
+                    )
+                    or not _valid_protection_scope_row(
+                        target_scope,
+                        vault_id=vault_id,
+                        scope_id=target.scope_id,
+                    )
+                    or not _valid_scoped_relationship_row(
+                        relationship_row,
+                        vault_id=vault_id,
+                        expected_key_version=(
+                            relationship_scope.envelope.scope_key_version
+                        ),
+                    )
+                    or not _valid_scoped_entity_row(
+                        source,
+                        vault_id=vault_id,
+                        expected_key_version=(
+                            source_scope.envelope.scope_key_version
+                        ),
+                    )
+                    or not _valid_scoped_entity_row(
+                        target,
+                        vault_id=vault_id,
+                        expected_key_version=(
+                            target_scope.envelope.scope_key_version
+                        ),
+                    )
+                ):
+                    raise IntegrityViolation()
+                relationships.append(relationship_row)
+                endpoint_ids.update(
+                    (
+                        relationship_row.from_entity_id,
+                        relationship_row.to_entity_id,
+                    )
+                )
+
+            selected_entity_ids = requested_entities | endpoint_ids
+            entities: list[ScopedEncryptedEntityRow] = []
+            for entity_id in sorted(selected_entity_ids):
+                entity_row = self._scoped_entities.get(
+                    (vault_id, entity_id)
+                )
+                if entity_row is None:
+                    continue
+                if not isinstance(entity_row, ScopedEncryptedEntityRow):
+                    raise IntegrityViolation()
+                if entity_row.scope_id not in allowed:
+                    continue
+                scope = self._protection_scopes.get(
+                    (vault_id, entity_row.scope_id)
+                )
+                if scope is None:
+                    continue
+                if (
+                    not _valid_protection_scope_row(
+                        scope,
+                        vault_id=vault_id,
+                        scope_id=entity_row.scope_id,
+                    )
+                    or not _valid_scoped_entity_row(
+                        entity_row,
+                        vault_id=vault_id,
+                        expected_key_version=scope.envelope.scope_key_version,
+                    )
+                ):
+                    raise IntegrityViolation()
+                entities.append(entity_row)
+
+            return ScopedEncryptedVaultSnapshotRow(
+                entities=tuple(entities[: entity_limit + 1]),
+                relationships=tuple(
+                    relationships[: relationship_limit + 1]
+                ),
             )
 
     def ciphertext_snapshot(self) -> dict[str, object]:

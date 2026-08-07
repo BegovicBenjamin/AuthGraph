@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import unittest
 import threading
+import unittest
 from contextlib import contextmanager
 from dataclasses import replace
 
@@ -618,6 +618,70 @@ class OtpScopedUnlockTests(unittest.TestCase):
         self.assertNotIsInstance(result[0], BaseException)
         self.service.lock(result[0])
 
+    def test_provider_release_through_session_open_holds_lifecycle_fence(
+        self,
+    ) -> None:
+        grant = self.otp_grant()
+        entered_open = threading.Event()
+        continue_open = threading.Event()
+        transition_finished = threading.Event()
+        original_open = self.sessions.open
+        unlock_results: list[object] = []
+        transition_results: list[object] = []
+
+        def blocking_open(*args, **kwargs):
+            entered_open.set()
+            if not continue_open.wait(timeout=5):
+                raise AssertionError("Timed out waiting to continue session open.")
+            return original_open(*args, **kwargs)
+
+        self.sessions.open = blocking_open  # type: ignore[method-assign]
+
+        def unlock_worker() -> None:
+            try:
+                unlock_results.append(
+                    self.service.unlock_with_provider(
+                        grant,
+                        self.policy,
+                        self.provider,
+                    )
+                )
+            except BaseException as exc:
+                unlock_results.append(exc)
+
+        def transition_worker() -> None:
+            try:
+                transition_results.append(
+                    self.sessions.begin_management_transition(
+                        self.PRINCIPAL,
+                        self.vault_id,
+                        1,
+                    )
+                )
+            except BaseException as exc:
+                transition_results.append(exc)
+            finally:
+                transition_finished.set()
+
+        unlock_thread = threading.Thread(target=unlock_worker)
+        transition_thread = threading.Thread(target=transition_worker)
+        unlock_thread.start()
+        self.assertTrue(entered_open.wait(timeout=5))
+        transition_thread.start()
+        self.assertFalse(transition_finished.wait(timeout=0.05))
+
+        continue_open.set()
+        unlock_thread.join(timeout=5)
+        transition_thread.join(timeout=5)
+        self.assertFalse(unlock_thread.is_alive())
+        self.assertFalse(transition_thread.is_alive())
+        self.assertEqual(len(unlock_results), 1)
+        self.assertNotIsInstance(unlock_results[0], BaseException)
+        self.assertEqual(len(transition_results), 1)
+        self.assertNotIsInstance(transition_results[0], BaseException)
+        with self.assertRaises(SessionUnavailable):
+            self.service.get_entity(unlock_results[0], self.order_entity)
+
     def test_provider_enrollment_and_unlock_do_not_invert_locks(self) -> None:
         grant = self.otp_grant()
         entered_open = threading.Event()
@@ -686,8 +750,9 @@ class OtpScopedUnlockTests(unittest.TestCase):
         unlock_thread.start()
         self.assertTrue(entered_open.wait(timeout=5))
         enrollment_thread.start()
-        reached_provider = enrollment_reached_provider.wait(timeout=5)
+        self.assertFalse(enrollment_reached_provider.wait(timeout=0.05))
         continue_open.set()
+        reached_provider = enrollment_reached_provider.wait(timeout=5)
         unlock_thread.join(timeout=5)
         enrollment_thread.join(timeout=5)
 

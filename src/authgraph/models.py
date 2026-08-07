@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any, Mapping
+from typing import Any
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,6 +180,7 @@ class PublicEntityRow:
     entity_id: str
     kind: str
     properties: Mapping[str, Any]
+    record_revision: int = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -191,6 +193,7 @@ class PublicRelationshipRow:
     to_entity_id: str
     kind: str
     properties: Mapping[str, Any]
+    record_revision: int = 1
 
 
 @dataclass(frozen=True, slots=True)

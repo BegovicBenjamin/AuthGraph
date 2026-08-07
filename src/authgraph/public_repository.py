@@ -22,7 +22,46 @@ class PublicGraphRepository(Protocol):
         entity_id: str,
     ) -> PublicEntityRow | None: ...
 
+    def replace_public_entity(
+        self,
+        graph_id: str,
+        entity_id: str,
+        expected_revision: int,
+        row: PublicEntityRow,
+    ) -> bool: ...
+
+    def delete_public_entity(
+        self,
+        graph_id: str,
+        entity_id: str,
+        expected_revision: int,
+    ) -> bool:
+        """Delete only when the revision matches and no public edge exists."""
+
+        ...
+
     def put_public_relationship(self, row: PublicRelationshipRow) -> bool: ...
+
+    def get_public_relationship(
+        self,
+        graph_id: str,
+        relationship_id: str,
+    ) -> PublicRelationshipRow | None: ...
+
+    def replace_public_relationship(
+        self,
+        graph_id: str,
+        relationship_id: str,
+        expected_revision: int,
+        row: PublicRelationshipRow,
+    ) -> bool: ...
+
+    def delete_public_relationship(
+        self,
+        graph_id: str,
+        relationship_id: str,
+        expected_revision: int,
+    ) -> bool: ...
 
     def get_public_graph_snapshot(
         self,

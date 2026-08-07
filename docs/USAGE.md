@@ -4,6 +4,9 @@ This guide covers the API that new applications should use.
 
 > AuthGraph is an early prototype. Use synthetic data only.
 
+For a real deployment boundary and release gates, also read
+[PRODUCTION_SETUP.md](PRODUCTION_SETUP.md).
+
 ## 1. Install
 
 You need:
@@ -56,7 +59,12 @@ authgraph schema apply \
   --no-input
 ```
 
-Verify without applying anything:
+On POSIX, the password file must be a regular file owned by the process user
+with mode `0600`. Do not place it in the repository.
+
+`schema apply` also runs fixed schema-metadata and data migrations. Before using
+it on an existing database, take a tested backup, stop conflicting writers, and
+test the upgrade against a copy. Verify without applying anything:
 
 ```bash
 authgraph schema verify \
@@ -76,7 +84,8 @@ Only `neo4j+s://`, `neo4j+ssc://`, `bolt+s://`, and `bolt+ssc://` addresses are
 accepted. Prefer `+s` with a CA-signed certificate. Use `+ssc` only when
 accepting a self-signed certificate is deliberate.
 
-The schema command never creates or drops a database.
+The schema commands never create or drop a database. `schema verify` is
+read-only.
 
 ## 3. Create the main service
 
@@ -198,8 +207,23 @@ End access explicitly:
 graph.lock(context)
 ```
 
-Expiry, lock, password change, provider revocation, shutdown, or process
-restart also removes future access.
+Every open and lease requires the vault to be `ACTIVE` at the session's exact
+envelope revision. Expiry, lock, password change, or session revocation blocks
+a new key lease. The in-memory broker also invalidates sessions on shutdown or
+restart. `DurableScopedSessionBroker` intentionally preserves valid wrapped
+sessions across a same-host restart, so use explicit close or vault revocation
+when restart must end access.
+
+Direct provider-slot revocation does not revoke resident sessions. Use
+`SecurityOperations`, which writes an audit intent, blocks admission, revokes
+sessions, and performs the provider mutation under one vault fence. This stops
+future provider-based release only; it does not disable direct passphrase
+unlock unless your host removes that path too.
+Interrupted password changes remain `REVISION_PENDING`. A trusted operator may
+call `private.reconcile_passphrase_change(principal_id, vault_id)`; it reads the
+authoritative Neo4j envelope. Never expose reconciliation as an AI or end-user
+tool. Interrupted management operations remain `BLOCKED`; follow
+[OPERATIONS.md](OPERATIONS.md).
 
 ## 6. Create nodes
 
@@ -234,6 +258,7 @@ product = graph.create_entity(
     {"name": "Example Headphones"},
     protection=ProtectionLevel.PUBLIC,
     publisher=publisher_capability,
+    idempotency_key="public-product-headphones",
 )
 ```
 
@@ -275,12 +300,14 @@ contains = graph.connect(
     {"quantity": 1},
     context=context,
     scope_id=orders_scope,
+    idempotency_key="contains-order-1001",
 )
 ```
 
 AuthGraph creates an encrypted anchor for the public endpoint and commits the
-anchor and encrypted connection atomically. Retry-safe idempotency for this
-mixed case is not implemented yet.
+anchor and encrypted connection atomically. An exact retry with the same
+idempotency key returns the same connection and helpers; reusing the key with
+changed semantics or endpoints conflicts.
 
 A plaintext public connection is allowed only between two public nodes:
 
@@ -301,10 +328,14 @@ related = graph.connect(
     {},
     protection=ProtectionLevel.PUBLIC,
     publisher=publisher_capability,
+    idempotency_key="public-related-products",
 )
 ```
 
-## 8. Read, update, and delete private data
+Public and private idempotency keys are scoped by the operation's trusted graph
+or protection scope. They are opaque retry keys, not user credentials.
+
+## 8. Read, update, and delete data
 
 Resolve a node:
 
@@ -331,7 +362,22 @@ updated = graph.update_entity(
 
 The update fails if another writer already changed that revision.
 
-Relationships have the same pattern:
+Public records use the same methods and optimistic revision checks. Public
+writes also require the trusted publisher capability:
+
+```python
+public_record = graph.get_entity("support", product)
+public_record = graph.update_entity(
+    "support",
+    product,
+    "Product",
+    {"name": "Example Headphones v2"},
+    expected_revision=public_record.record_revision,
+    publisher=publisher_capability,
+)
+```
+
+Relationships have the same pattern for both protection levels:
 
 ```python
 edge = graph.get_relationship("support", placed, context=context)
@@ -375,8 +421,14 @@ It fails while any encrypted connection still touches the node, including a
 connection hidden by a locked scope. AuthGraph never performs an unrestricted
 cascade delete.
 
-Public update, delete, lookup by relationship reference, and public
-idempotency are not implemented.
+Public entity deletion similarly refuses incident public relationships and
+requires the exact revision plus publisher authorization. It cannot inspect
+encrypted mixed-edge semantics in the private repository. Deleting a referenced
+public endpoint can therefore leave its encrypted anchor and relationship;
+unlocked views omit that unresolved edge. A trusted
+`delete_relationship(..., context=..., expected_revision=...)` call can still
+remove the private edge and its unshared helper anchor atomically. Apply an
+application policy and cleanup workflow before public endpoint deletion.
 
 ## 9. Read graph views
 
@@ -434,6 +486,36 @@ tool = SessionBoundRetrievalTool(gateway, context=context)
 result = tool.search("Where is my order?")
 ```
 
+Without a candidate index, each private search reads and decrypts one bounded
+complete session-visible snapshot. For repeated searches, build a candidate
+index once and keep it only for that secure session:
+
+```python
+with gateway.build_candidate_index(context=context) as candidates:
+    tool = SessionBoundRetrievalTool(
+        gateway,
+        context=context,
+        candidate_index=candidates,
+    )
+    first = tool.search("Where is my order?")
+    second = tool.search("Which products are in it?")
+```
+
+The build still decrypts one complete bounded projection in trusted memory.
+The index retains allowlisted lexical token counts plus opaque IDs/topology;
+the hard index ceilings are 1,000 entities and 2,000 relationships, while
+stricter snapshot limits may apply. Treat it as sensitive. Later searches rank
+that index, then ask Neo4j for only the exact selected ciphertext rows and
+decrypt their granted endpoints. It is
+strictly bound to the same gateway and context; a closed, wrong-context, or
+expired session fails instead of falling back to public data.
+
+Candidate selection reflects the build-time tokens/topology, although selected
+rows are read again in their current encrypted form. Rebuild after graph
+changes when discovery freshness matters, and always close the index when the
+session ends. This is exact targeted retrieval, not semantic search over
+encrypted properties inside Neo4j.
+
 The AI gets `result`, not `context`. Without a context, the same tool searches
 only public data:
 
@@ -441,26 +523,50 @@ only public data:
 public_tool = SessionBoundRetrievalTool(gateway)
 ```
 
-AuthGraph currently obtains the private view by decrypting a bounded complete
-snapshot of the session's granted scopes in trusted memory, then filtering and
-ranking it. It does not yet run targeted search over encrypted Neo4j rows.
-
 If you send retrieved plaintext to an external AI, that AI can read it.
 AuthGraph controls retrieval; it cannot force an external service to forget
 data it received.
 
 ## 11. One-time-code unlock
 
-The included OTP broker and scope-key provider can test this flow:
+The OTP broker and scope-key-provider interfaces support this flow:
 
 1. your backend creates and sends a short one-time code;
 2. the code proves authorization to a trusted provider;
-3. the provider releases a fixed configured set of scope keys;
-4. AuthGraph opens a short session.
+3. under one vault guard, the provider releases a fixed configured set of
+   scope keys; and
+4. AuthGraph opens a short session only while the vault remains `ACTIVE` at the
+   grant's exact revision.
 
-The code is never an encryption key. The included implementation is in-memory
-only. Production needs real email/SMS delivery, rate limiting, abuse
-protection, and a KMS or HSM-backed key provider.
+The code is never an encryption key. The default broker, grant policy, session
+broker, and key provider are in-memory test components. Optional
+`DurableOneTimeCodeBroker`, `DurableScopeGrantPolicy`,
+`DurableScopedSessionBroker`, and `SqliteKeySlotStore` survive restarts and
+coordinate processes on one host. They are not multi-host authorization
+backends.
+
+`DurableOneTimeCodeBroker(..., ttl_seconds=600)` sets a ten-minute maximum.
+Expiry does not automatically send a new code. A server-controlled resend
+calls `issue()` again with the same binding, replacing the old challenge and
+counting against the issue limit. Load the OTP, grant, session, and audit HMAC
+keys as separate stable secrets; do not generate new values at each restart.
+
+AuthGraph does not know an email address or send messages. The host resolves a
+previously verified destination, sends the caller-owned code buffer, clears it,
+and accepts verification through a dedicated form outside chat. See
+[OTP_EMAIL_ADAPTER.md](OTP_EMAIL_ADAPTER.md) for the exact flow.
+
+For provider-shaped custody, combine `EnvelopeScopeKeyProvider`, a managed
+`KeyWrappingBackend` such as the injected-client
+`AwsKmsKeyWrappingBackend`, and an atomic `KeySlotStore`. The included SQLite
+slot store is still a single-host reference. Production also needs provider
+credentials/policies, shared strongly consistent state for multiple hosts,
+account and network rate limits, monitoring, and reviewed recovery.
+
+Routine `MirroredKeyWrappingBackend.unwrap_key()` uses its primary backend only
+and never silently falls back to recovery. Recovery is an explicit operation
+that consumes a fixed single-use recovery grant, rewraps into a different
+provider generation, and records pseudonymous source provenance.
 
 See [CHATBOT_GRAPHRAG_DESIGN.md](CHATBOT_GRAPHRAG_DESIGN.md) for the trust
 boundary and provider flow.
@@ -476,15 +582,32 @@ graph.change_passphrase(
 )
 ```
 
-This rewraps the vault key and revokes older sessions. It does not decrypt and
-rewrite every graph record.
+This prepares a fail-closed revision transition, revokes existing sessions,
+changes only the wrapped vault key, and activates the new revision after the
+graph compare-and-swap. It does not rewrite graph records. An interruption
+requires the trusted reconciliation path described above.
 
 On application shutdown:
 
 ```python
+otp.close()       # if an OTP broker is active
+grants.close()    # if a grant policy is active
 sessions.close_all()
 driver.close()
 ```
+
+The durable brokers are context managers. Close admission before the driver
+and provider clients. `SqliteKeySlotStore` opens a transaction per operation
+and has no persistent client to close; the injected KMS client remains owned by
+the host application. For `DurableScopedSessionBroker`, `close_all()` closes
+only the local broker handle; it deliberately does not revoke unexpired
+persisted sessions. Call `close(context)` or `revoke_vault()` when revocation is
+intended.
+
+The durable broker tracks each active key lease with its own expiry-bound row.
+After a worker crash, purge can reclaim stale rows and delete revoked wrapped
+session ciphertext. This cannot recall plaintext already copied into a process
+and does not prove complete memory zeroization.
 
 ## 13. Tests
 
@@ -522,5 +645,6 @@ never clear the whole database.
 - `LegacyAuthGraphService` is the old one-key whole-vault API.
 - `LayeredGraphService` is the old v1 public/private façade.
 
-There is no automatic migration from v1 to v2. New applications should use
-`AuthGraph`.
+There is no automatic migration from legacy v1 encrypted records to scoped-v2
+data. This is separate from packaged Neo4j schema-version migrations. New
+applications should use `AuthGraph`.

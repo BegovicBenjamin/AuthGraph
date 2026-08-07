@@ -9,12 +9,17 @@ from authgraph.models import (
     KdfParameters,
     KeyEnvelope,
     ProtectionScopeRow,
-    ScopeKeyEnvelope,
     ScopedEncryptedEntityRow,
     ScopedEncryptedRelationshipRow,
+    ScopeKeyEnvelope,
     VaultRow,
 )
-from authgraph.neo4j_scoped_repository import Neo4jScopedGraphRepository
+from authgraph.neo4j_scoped_repository import (
+    IncompleteCommit as ScopedIncompleteCommit,
+)
+from authgraph.neo4j_scoped_repository import (
+    Neo4jScopedGraphRepository,
+)
 
 
 class SequencedRecordingDriver:
@@ -195,7 +200,9 @@ class Neo4jScopedRepositoryTests(unittest.TestCase):
             Neo4jScopedGraphRepository._REPLACE_SCOPED_RELATIONSHIP,
             Neo4jScopedGraphRepository._DELETE_SCOPED_ENTITY,
             Neo4jScopedGraphRepository._DELETE_SCOPED_RELATIONSHIP,
+            Neo4jScopedGraphRepository._DELETE_SCOPED_RELATIONSHIP_BUNDLE,
             Neo4jScopedGraphRepository._GET_SCOPED_VAULT_SNAPSHOT,
+            Neo4jScopedGraphRepository._GET_SCOPED_TARGETED_SNAPSHOT,
         )
         for query in scoped_queries:
             with self.subTest(query=query[:60]):
@@ -222,7 +229,9 @@ class Neo4jScopedRepositoryTests(unittest.TestCase):
             Neo4jScopedGraphRepository._GET_SCOPED_ENTITY,
             Neo4jScopedGraphRepository._PUT_SCOPED_RELATIONSHIP,
             Neo4jScopedGraphRepository._GET_SCOPED_RELATIONSHIP,
+            Neo4jScopedGraphRepository._DELETE_SCOPED_RELATIONSHIP_BUNDLE,
             Neo4jScopedGraphRepository._GET_SCOPED_VAULT_SNAPSHOT,
+            Neo4jScopedGraphRepository._GET_SCOPED_TARGETED_SNAPSHOT,
         ):
             self.assertIn("$allowed_scope_ids", query)
 
@@ -244,7 +253,9 @@ class Neo4jScopedRepositoryTests(unittest.TestCase):
             Neo4jScopedGraphRepository._PUT_SCOPED_RELATIONSHIP,
             Neo4jScopedGraphRepository._PUT_SCOPED_ENTITY_RELATIONSHIP_BUNDLE,
             Neo4jScopedGraphRepository._GET_SCOPED_RELATIONSHIP,
+            Neo4jScopedGraphRepository._DELETE_SCOPED_RELATIONSHIP_BUNDLE,
             Neo4jScopedGraphRepository._GET_SCOPED_VAULT_SNAPSHOT,
+            Neo4jScopedGraphRepository._GET_SCOPED_TARGETED_SNAPSHOT,
         ):
             with self.subTest(query=query[:60]):
                 self.assertIn(
@@ -267,7 +278,9 @@ class Neo4jScopedRepositoryTests(unittest.TestCase):
             Neo4jScopedGraphRepository._PUT_SCOPED_RELATIONSHIP,
             Neo4jScopedGraphRepository._PUT_SCOPED_ENTITY_RELATIONSHIP_BUNDLE,
             Neo4jScopedGraphRepository._GET_SCOPED_RELATIONSHIP,
+            Neo4jScopedGraphRepository._DELETE_SCOPED_RELATIONSHIP_BUNDLE,
             Neo4jScopedGraphRepository._GET_SCOPED_VAULT_SNAPSHOT,
+            Neo4jScopedGraphRepository._GET_SCOPED_TARGETED_SNAPSHOT,
         ):
             with self.subTest(query=query[:60]):
                 self.assertIn(
@@ -826,6 +839,90 @@ class Neo4jScopedRepositoryTests(unittest.TestCase):
                         relationship_limit=5,
                     )
 
+    def test_targeted_snapshot_uses_one_fixed_id_and_scope_fenced_query(
+        self,
+    ) -> None:
+        first_entity = entity_record()
+        second_entity = entity_record(
+            "scoped_entity_2",
+            scope_id="scope_profile",
+        )
+        relation = relationship_record()
+        repository, driver = self.repository(
+            [[{
+                "entities": [first_entity, second_entity],
+                "relationships": [relation],
+            }]]
+        )
+
+        snapshot = repository.get_scoped_targeted_snapshot(
+            self.PRINCIPAL,
+            self.VAULT,
+            7,
+            self.ALLOWED,
+            ("scoped_entity_1",),
+            ("scoped_relationship_1",),
+            entity_limit=3,
+            relationship_limit=1,
+        )
+
+        assert snapshot is not None
+        self.assertEqual(
+            {row.entity_id for row in snapshot.entities},
+            {"scoped_entity_1", "scoped_entity_2"},
+        )
+        self.assertEqual(
+            [row.relationship_id for row in snapshot.relationships],
+            ["scoped_relationship_1"],
+        )
+        query, kwargs = driver.calls[0]
+        self.assertEqual(
+            query,
+            Neo4jScopedGraphRepository._GET_SCOPED_TARGETED_SNAPSHOT,
+        )
+        parameters = kwargs["parameters_"]
+        self.assertEqual(parameters["entity_ids"], ["scoped_entity_1"])
+        self.assertEqual(
+            parameters["relationship_ids"],
+            ["scoped_relationship_1"],
+        )
+        self.assertEqual(parameters["entity_fetch_limit"], 4)
+        self.assertEqual(parameters["relationship_fetch_limit"], 2)
+        self.assertEqual(
+            parameters["allowed_scope_ids"],
+            list(self.ALLOWED),
+        )
+        self.assertNotIn("scoped_entity_1", query)
+        self.assertNotIn("scoped_relationship_1", query)
+
+    def test_targeted_snapshot_rejects_unrequested_or_missing_endpoints(
+        self,
+    ) -> None:
+        malformed_results = (
+            {
+                "entities": [entity_record("unrequested")],
+                "relationships": [],
+            },
+            {
+                "entities": [entity_record()],
+                "relationships": [relationship_record()],
+            },
+        )
+        for result in malformed_results:
+            with self.subTest(result=result):
+                repository, _ = self.repository([[result]])
+                with self.assertRaises(IntegrityViolation):
+                    repository.get_scoped_targeted_snapshot(
+                        self.PRINCIPAL,
+                        self.VAULT,
+                        7,
+                        self.ALLOWED,
+                        ("scoped_entity_1",),
+                        ("scoped_relationship_1",),
+                        entity_limit=3,
+                        relationship_limit=1,
+                    )
+
     def test_snapshot_missing_vault_and_invalid_limits_fail_closed(self) -> None:
         repository, _ = self.repository([[]])
         self.assertIsNone(
@@ -1050,6 +1147,58 @@ class Neo4jScopedRepositoryTests(unittest.TestCase):
             entity_query,
         )
         self.assertNotIn("DETACH DELETE", entity_query)
+
+    def test_scoped_bundle_delete_is_atomic_and_restrictive(self) -> None:
+        repository, driver = self.repository(
+            [[{"deleted": 1, "helpers_deleted": 2}]]
+        )
+        self.assertTrue(
+            repository.delete_scoped_relationship_bundle(
+                self.PRINCIPAL,
+                self.VAULT,
+                5,
+                self.ALLOWED,
+                "scoped_relationship_1",
+                2,
+                ("scoped_anchor_1", "scoped_anchor_2"),
+            )
+        )
+        query, parameters = (
+            driver.calls[0][0],
+            driver.calls[0][1]["parameters_"],
+        )
+        self.assertEqual(
+            query,
+            Neo4jScopedGraphRepository._DELETE_SCOPED_RELATIONSHIP_BUNDLE,
+        )
+        self.assertEqual(
+            parameters["helper_entity_ids"],
+            ["scoped_anchor_1", "scoped_anchor_2"],
+        )
+        self.assertEqual(parameters["expected_record_revision"], 2)
+        self.assertIn(
+            "relationship_scope.scope_id IN $allowed_scope_ids",
+            query,
+        )
+        self.assertIn("source_scope.scope_id IN $allowed_scope_ids", query)
+        self.assertIn("target_scope.scope_id IN $allowed_scope_ids", query)
+        self.assertIn("other.relationship_id <> $relationship_id", query)
+        self.assertNotIn("DETACH DELETE", query)
+
+        reconciled, _ = self.repository(
+            [ScopedIncompleteCommit(), [], [], []]
+        )
+        self.assertTrue(
+            reconciled.delete_scoped_relationship_bundle(
+                self.PRINCIPAL,
+                self.VAULT,
+                5,
+                self.ALLOWED,
+                "scoped_relationship_1",
+                2,
+                ("scoped_anchor_1", "scoped_anchor_2"),
+            )
+        )
 
     def test_invalid_record_revisions_fail_closed(self) -> None:
         repository, driver = self.repository([[entity_record(

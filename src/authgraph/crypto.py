@@ -25,7 +25,6 @@ from cryptography.hazmat.primitives.kdf.argon2 import Argon2id
 from .errors import IntegrityViolation, UnlockDenied, ValidationError
 from .models import EncryptedPayload, KdfParameters, KeyEnvelope
 
-
 AES_KEY_BYTES = 32
 NONCE_BYTES = 12
 SALT_BYTES = 16

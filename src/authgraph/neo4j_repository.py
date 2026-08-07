@@ -10,7 +10,8 @@ connection or read configuration.
 
 from __future__ import annotations
 
-from typing import Any, Iterable
+from collections.abc import Iterable
+from typing import TYPE_CHECKING, Any
 
 from .errors import IntegrityViolation
 from .models import (
@@ -24,11 +25,14 @@ from .models import (
     VaultRow,
 )
 
-try:
+if TYPE_CHECKING:
     from neo4j.exceptions import IncompleteCommit
-except ImportError:  # Unit tests do not require the optional runtime driver.
-    class IncompleteCommit(Exception):
-        """Fallback type used only when the Neo4j driver is not installed."""
+else:
+    try:
+        from neo4j.exceptions import IncompleteCommit
+    except ImportError:  # Unit tests do not require the runtime driver.
+        class IncompleteCommit(Exception):
+            """Fallback used only when the Neo4j driver is unavailable."""
 
 
 class Neo4jGraphRepository:

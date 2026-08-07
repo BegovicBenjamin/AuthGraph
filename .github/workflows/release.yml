@@ -1,0 +1,128 @@
+name: Release artifacts
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      publish_target:
+        description: "Optional package index; publication also requires a tag and environment approval"
+        required: true
+        default: none
+        type: choice
+        options:
+          - none
+          - testpypi
+          - pypi
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build release evidence
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.14"
+          cache: pip
+      - name: Read and validate the version
+        id: version
+        shell: bash
+        run: |
+          package_version=$(python -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"])')
+          if [[ "$GITHUB_REF_TYPE" == "tag" && "$GITHUB_REF_NAME" != "v$package_version" ]]; then
+            echo "Tag must exactly match pyproject.toml as v$package_version." >&2
+            exit 1
+          fi
+          echo "version=$package_version" >>"$GITHUB_OUTPUT"
+      - name: Install release tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install . "build>=1.2,<2" "mypy>=1.13,<2" \
+            "pip-audit>=2.7,<3" "ruff>=0.9,<1" "twine>=6,<7"
+      - name: Run static checks
+        run: |
+          ruff check src tests scripts
+          python -m mypy src/authgraph
+          python -m compileall -q src tests scripts
+      - name: Run unit tests
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: python -X dev -m unittest discover -s tests -v
+      - name: Audit resolved project dependencies
+        run: |
+          mkdir -p release-evidence
+          python -m pip_audit --strict --progress-spinner off \
+            --format=json --output=release-evidence/pip-audit.json .
+      - name: Build distributions
+        run: python -m build
+      - name: Check distribution metadata
+        run: python -m twine check dist/*
+      - name: Install and smoke-test the wheel
+        shell: bash
+        run: |
+          python -m venv "$RUNNER_TEMP/authgraph-release-smoke"
+          "$RUNNER_TEMP/authgraph-release-smoke/bin/python" -m pip install --upgrade pip
+          "$RUNNER_TEMP/authgraph-release-smoke/bin/python" -m pip install dist/*.whl
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/authgraph-release-smoke/bin/python" \
+            "$GITHUB_WORKSPACE/scripts/ci/installed-wheel-smoke.py" \
+            --expected-version "${{ steps.version.outputs.version }}" \
+            --source-root "$GITHUB_WORKSPACE"
+      - name: Record artifact hashes
+        run: sha256sum dist/* >release-evidence/SHA256SUMS
+      - name: Upload immutable build inputs for approved publication
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: authgraph-release-${{ steps.version.outputs.version }}
+          path: |
+            dist/*
+            release-evidence/*
+          if-no-files-found: error
+          retention-days: 30
+
+  publish-testpypi:
+    name: Publish to TestPyPI
+    needs: build
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      github.ref_type == 'tag' &&
+      inputs.publish_target == 'testpypi'
+    runs-on: ubuntu-latest
+    environment: testpypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: authgraph-release-${{ needs.build.outputs.version }}
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          packages-dir: dist/
+
+  publish-pypi:
+    name: Publish to PyPI
+    needs: build
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      github.ref_type == 'tag' &&
+      inputs.publish_target == 'pypi'
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: authgraph-release-${{ needs.build.outputs.version }}
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+        with:
+          packages-dir: dist/

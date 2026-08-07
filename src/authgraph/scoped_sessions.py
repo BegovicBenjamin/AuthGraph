@@ -2,29 +2,34 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import math
 import os
 import threading
 import time
-from contextlib import contextmanager
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Callable, Iterator, Mapping
+from typing import Protocol
 
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from .crypto import AES_KEY_BYTES, NONCE_BYTES, clear_bytearray
 from .errors import SessionUnavailable, ValidationError
+from .lifecycle import (
+    VaultGuard,
+    VaultLifecycleState,
+    VaultManagementTransition,
+    VaultRevisionTransition,
+)
 from .models import AccessContext
 from .sessions import (
     ABSOLUTE_MAX_TTL_SECONDS,
     DEFAULT_SWEEP_INTERVAL_SECONDS,
     InMemorySessionBroker,
 )
-
 
 MAX_SCOPES_PER_SESSION = 32
 
@@ -52,6 +57,55 @@ class ScopedSessionLease:
     envelope_revision: int
     root_key_version: int
     scope_keys: Mapping[str, ScopedKeyLease] = field(repr=False)
+
+
+class ScopedSessionBrokerProtocol(Protocol):
+    """Typed session surface shared by memory and durable v2 brokers."""
+
+    def vault_guard(
+        self,
+        principal_id: str,
+        vault_id: str,
+    ) -> AbstractContextManager[VaultGuard]: ...
+
+    def open(
+        self,
+        principal_id: str,
+        vault_id: str,
+        scope_keys: Mapping[str, ScopeKeyMaterial],
+        *,
+        envelope_revision: int,
+        root_key_version: int,
+        ttl_seconds: int | None = None,
+        not_after: float | None = None,
+    ) -> AccessContext: ...
+
+    def close(self, context: AccessContext) -> None: ...
+
+    def guarded_lease(
+        self,
+        context: AccessContext,
+    ) -> AbstractContextManager[ScopedSessionLease]: ...
+
+    def prepare_revision_change(
+        self,
+        principal_id: str,
+        vault_id: str,
+        current_revision: int,
+        next_revision: int,
+    ) -> VaultRevisionTransition: ...
+
+    def finalize_revision_change(
+        self,
+        transition: VaultRevisionTransition,
+    ) -> VaultLifecycleState: ...
+
+    def reconcile_revision_change(
+        self,
+        principal_id: str,
+        vault_id: str,
+        authoritative_revision: int,
+    ) -> VaultLifecycleState: ...
 
 
 @dataclass(slots=True)
@@ -189,11 +243,11 @@ class ScopedSessionBroker:
         self,
         principal_id: str,
         vault_id: str,
-    ) -> Iterator[None]:
+    ) -> Iterator[VaultGuard]:
         """Serialize scoped lifecycle operations for one local vault."""
 
-        with self._base.vault_guard(principal_id, vault_id):
-            yield
+        with self._base.vault_guard(principal_id, vault_id) as guard:
+            yield guard
 
     def open(
         self,
@@ -411,6 +465,10 @@ class ScopedSessionBroker:
 
     def revoke_vault(self, principal_id: str, vault_id: str) -> int:
         revoked = self._base.revoke_vault(principal_id, vault_id)
+        self._clear_vault_records(principal_id, vault_id)
+        return revoked
+
+    def _clear_vault_records(self, principal_id: str, vault_id: str) -> None:
         with self._lock:
             for digest, record in list(self._records.items()):
                 if (
@@ -418,7 +476,83 @@ class ScopedSessionBroker:
                     and record.vault_id == vault_id
                 ):
                     self._clear_record(self._records.pop(digest))
-        return revoked
+
+    def prepare_revision_change(
+        self,
+        principal_id: str,
+        vault_id: str,
+        current_revision: int,
+        next_revision: int,
+    ) -> VaultRevisionTransition:
+        transition = self._base.prepare_revision_change(
+            principal_id,
+            vault_id,
+            current_revision,
+            next_revision,
+        )
+        self._clear_vault_records(principal_id, vault_id)
+        return transition
+
+    def finalize_revision_change(
+        self,
+        transition: VaultRevisionTransition,
+    ) -> VaultLifecycleState:
+        return self._base.finalize_revision_change(transition)
+
+    def reconcile_revision_change(
+        self,
+        principal_id: str,
+        vault_id: str,
+        authoritative_revision: int,
+    ) -> VaultLifecycleState:
+        state = self._base.reconcile_revision_change(
+            principal_id,
+            vault_id,
+            authoritative_revision,
+        )
+        self._clear_vault_records(principal_id, vault_id)
+        return state
+
+    def begin_management_transition(
+        self,
+        principal_id: str,
+        vault_id: str,
+        envelope_revision: int,
+    ) -> VaultManagementTransition:
+        transition = self._base.begin_management_transition(
+            principal_id,
+            vault_id,
+            envelope_revision,
+        )
+        self._clear_vault_records(principal_id, vault_id)
+        return transition
+
+    def finalize_management_transition(
+        self,
+        transition: VaultManagementTransition,
+    ) -> VaultLifecycleState:
+        return self._base.finalize_management_transition(transition)
+
+    def reconcile_management_transition(
+        self,
+        principal_id: str,
+        vault_id: str,
+        authoritative_revision: int,
+        blocked_generation: int,
+    ) -> VaultLifecycleState:
+        return self._base.reconcile_management_transition(
+            principal_id,
+            vault_id,
+            authoritative_revision,
+            blocked_generation,
+        )
+
+    def get_lifecycle_state(
+        self,
+        principal_id: str,
+        vault_id: str,
+    ) -> VaultLifecycleState | None:
+        return self._base.get_lifecycle_state(principal_id, vault_id)
 
     def advance_envelope_revision(
         self,

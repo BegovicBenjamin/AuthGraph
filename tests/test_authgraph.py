@@ -20,13 +20,13 @@ from authgraph import (
     UnlockDenied,
     ValidationError,
 )
+from authgraph.crypto import MAX_ACCEPTED_MEMORY_KIB, clear_bytearray
 from authgraph.models import (
     AccessContext,
     EncryptedEntityRow,
     EncryptedPayload,
     EncryptedRelationshipRow,
 )
-from authgraph.crypto import MAX_ACCEPTED_MEMORY_KIB, clear_bytearray
 from authgraph.neo4j_repository import IncompleteCommit, Neo4jGraphRepository
 from authgraph.service import MAX_VAULT_SNAPSHOT_CIPHERTEXT_BYTES
 
@@ -549,6 +549,79 @@ class AuthGraphSecurityTests(unittest.TestCase):
         self.assertEqual(broker.close_all(), 0)
         self.assertEqual(broker.tracked_vault_count, 0)
 
+    def test_existing_active_lifecycle_requires_exact_open_revision(self) -> None:
+        broker = InMemorySessionBroker(
+            sweep_interval_seconds=None,
+            clock=self.clock,
+        )
+        self.addCleanup(broker.close_all)
+        old_context = broker.open(
+            "principal-1",
+            "vault-1",
+            b"a" * 32,
+            envelope_revision=1,
+            key_version=1,
+        )
+        with self.assertRaises(SessionUnavailable):
+            broker.open(
+                "principal-1",
+                "vault-1",
+                b"a" * 32,
+                envelope_revision=2,
+                key_version=1,
+            )
+        broker.advance_envelope_revision("principal-1", "vault-1", 2)
+        new_context = broker.open(
+            "principal-1",
+            "vault-1",
+            b"a" * 32,
+            envelope_revision=2,
+            key_version=1,
+        )
+        with self.assertRaises(SessionUnavailable):
+            with broker.lease(old_context):
+                pass
+        broker.close(new_context)
+
+    def test_blocked_management_transition_cannot_be_implicitly_retried(
+        self,
+    ) -> None:
+        broker = InMemorySessionBroker(
+            sweep_interval_seconds=None,
+            clock=self.clock,
+        )
+        self.addCleanup(broker.close_all)
+        context = broker.open(
+            "principal-1",
+            "vault-1",
+            b"a" * 32,
+            envelope_revision=1,
+            key_version=1,
+        )
+        transition = broker.begin_management_transition(
+            "principal-1",
+            "vault-1",
+            1,
+        )
+        with self.assertRaises(SessionUnavailable):
+            broker.begin_management_transition("principal-1", "vault-1", 1)
+        with self.assertRaises(SessionUnavailable):
+            with broker.lease(context):
+                pass
+        with self.assertRaises(SessionUnavailable):
+            broker.reconcile_management_transition(
+                "principal-1",
+                "vault-1",
+                1,
+                transition.generation + 1,
+            )
+        broker.reconcile_management_transition(
+            "principal-1",
+            "vault-1",
+            1,
+            transition.generation,
+        )
+
     def test_revision_capacity_cannot_fail_after_password_commit(self) -> None:
         repository = InMemoryGraphRepository()
         broker = InMemorySessionBroker(
@@ -1060,6 +1133,19 @@ class AuthGraphSecurityTests(unittest.TestCase):
         with self.assertRaises(SessionUnavailable):
             with sessions.lease(old_context):
                 self.fail("Ambiguous commit retained an old DEK session.")
+        with self.assertRaises(SessionUnavailable):
+            service.unlock(
+                "idp|owner-alice",
+                vault_id,
+                self.ALICE_NEW_PASSWORD,
+            )
+        self.assertEqual(
+            service.reconcile_passphrase_change(
+                "idp|owner-alice",
+                vault_id,
+            ),
+            2,
+        )
         new_context = service.unlock(
             "idp|owner-alice",
             vault_id,

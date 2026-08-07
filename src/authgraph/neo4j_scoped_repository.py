@@ -16,10 +16,10 @@ from .models import (
     EncryptedPayload,
     KeyEnvelope,
     ProtectionScopeRow,
-    ScopeKeyEnvelope,
     ScopedEncryptedEntityRow,
     ScopedEncryptedRelationshipRow,
     ScopedEncryptedVaultSnapshotRow,
+    ScopeKeyEnvelope,
     VaultRow,
 )
 from .neo4j_repository import IncompleteCommit, Neo4jGraphRepository
@@ -30,7 +30,6 @@ from .scoped_crypto import (
 )
 from .scoped_service import SCOPED_PAYLOAD_VERSION
 from .scoped_sessions import MAX_SCOPES_PER_SESSION
-
 
 MAX_OPAQUE_ID_CHARS = 256
 AES_GCM_NONCE_BYTES = 12
@@ -639,6 +638,66 @@ class Neo4jScopedGraphRepository(Neo4jGraphRepository):
     RETURN 1 AS deleted
     """
 
+    _DELETE_SCOPED_RELATIONSHIP_BUNDLE = """
+    MATCH (vault:AGVault {
+        vault_id: $vault_id,
+        principal_id: $principal_id,
+        envelope_version: 2
+    })
+    SET vault._authgraph_lock = true
+    REMOVE vault._authgraph_lock
+    WITH vault
+    WHERE vault.envelope_revision = $envelope_revision
+    MATCH (vault)-[:AG_HAS_SCOPE]->(
+        relationship_scope:AGProtectionScope {vault_id: $vault_id}
+    )
+    MATCH (vault)-[:AG_HAS_SCOPE]->(source_scope:AGProtectionScope {
+        vault_id: $vault_id
+    })-[:AG_PROTECTS]->(source:AGScopedEntity {vault_id: $vault_id})
+    MATCH (vault)-[:AG_HAS_SCOPE]->(target_scope:AGProtectionScope {
+        vault_id: $vault_id
+    })-[:AG_PROTECTS]->(target:AGScopedEntity {vault_id: $vault_id})
+    MATCH (source)-[link:AG_SCOPED_LINK {
+        vault_id: $vault_id,
+        relationship_id: $relationship_id
+    }]->(target)
+    WHERE
+        relationship_scope.scope_id = link.scope_id
+        AND relationship_scope.scope_id IN $allowed_scope_ids
+        AND relationship_scope.root_key_version = vault.key_version
+        AND source_scope.scope_id IN $allowed_scope_ids
+        AND source_scope.root_key_version = vault.key_version
+        AND target_scope.scope_id IN $allowed_scope_ids
+        AND target_scope.root_key_version = vault.key_version
+        AND source.scope_id = source_scope.scope_id
+        AND target.scope_id = target_scope.scope_id
+        AND coalesce(link.record_revision, 1)
+            = $expected_record_revision
+    WITH relationship_scope, source, target, link
+    MATCH (relationship_scope)-[protects:AG_PROTECTS]->(
+        helper:AGScopedEntity {vault_id: $vault_id}
+    )
+    WHERE
+        helper.entity_id IN $helper_entity_ids
+        AND helper.scope_id = relationship_scope.scope_id
+        AND helper.entity_id IN [source.entity_id, target.entity_id]
+    WITH
+        link,
+        collect(DISTINCT helper) AS helpers,
+        collect(DISTINCT protects) AS protections
+    WHERE
+        size(helpers) = size($helper_entity_ids)
+        AND size(protections) = size($helper_entity_ids)
+        AND all(helper IN helpers WHERE NOT EXISTS {
+            MATCH (helper)-[other:AG_SCOPED_LINK]-()
+            WHERE other.relationship_id <> $relationship_id
+        })
+    DELETE link
+    FOREACH (protection IN protections | DELETE protection)
+    FOREACH (helper IN helpers | DELETE helper)
+    RETURN 1 AS deleted, size(helpers) AS helpers_deleted
+    """
+
     _GET_SCOPED_VAULT_SNAPSHOT = """
     MATCH (vault:AGVault {
         vault_id: $vault_id,
@@ -734,6 +793,136 @@ class Neo4jScopedGraphRepository(Neo4jGraphRepository):
         } AS relationships
     """
 
+    _GET_SCOPED_TARGETED_SNAPSHOT = """
+    MATCH (vault:AGVault {
+        vault_id: $vault_id,
+        principal_id: $principal_id,
+        envelope_version: 2
+    })
+    SET vault._authgraph_lock = true
+    REMOVE vault._authgraph_lock
+    WITH vault
+    WHERE vault.envelope_revision = $envelope_revision
+    RETURN
+        COLLECT {
+            MATCH (vault)-[:AG_HAS_SCOPE]->(scope:AGProtectionScope {
+                vault_id: $vault_id
+            })-[:AG_PROTECTS]->(entity:AGScopedEntity {
+                vault_id: $vault_id
+            })
+            WHERE
+                scope.scope_id IN $allowed_scope_ids
+                AND scope.root_key_version = vault.key_version
+                AND entity.scope_id = scope.scope_id
+                AND (
+                    entity.entity_id IN $entity_ids
+                    OR EXISTS {
+                        MATCH (entity)-[selected:AG_SCOPED_LINK {
+                            vault_id: $vault_id
+                        }]-(other:AGScopedEntity {
+                            vault_id: $vault_id
+                        })
+                        MATCH (vault)-[:AG_HAS_SCOPE]->(
+                            selected_scope:AGProtectionScope {
+                                vault_id: $vault_id
+                            }
+                        )
+                        MATCH (vault)-[:AG_HAS_SCOPE]->(
+                            other_scope:AGProtectionScope {
+                                vault_id: $vault_id
+                            }
+                        )-[:AG_PROTECTS]->(other)
+                        WHERE
+                            selected.relationship_id
+                                IN $relationship_ids
+                            AND selected.scope_id
+                                = selected_scope.scope_id
+                            AND selected_scope.scope_id
+                                IN $allowed_scope_ids
+                            AND selected_scope.root_key_version
+                                = vault.key_version
+                            AND other.scope_id = other_scope.scope_id
+                            AND other_scope.scope_id
+                                IN $allowed_scope_ids
+                            AND other_scope.root_key_version
+                                = vault.key_version
+                    }
+                )
+            WITH scope, entity
+            ORDER BY entity.entity_id
+            LIMIT $entity_fetch_limit
+            RETURN {
+                vault_id: entity.vault_id,
+                scope_id: entity.scope_id,
+                entity_id: entity.entity_id,
+                record_revision: coalesce(entity.record_revision, 1),
+                protection_scope_key_version: scope.scope_key_version,
+                payload_version: entity.payload_version,
+                key_version: entity.key_version,
+                algorithm: entity.algorithm,
+                nonce: entity.nonce,
+                ciphertext: entity.ciphertext
+            } AS entity_row
+        } AS entities,
+        COLLECT {
+            MATCH (vault)-[:AG_HAS_SCOPE]->(
+                relationship_scope:AGProtectionScope {
+                    vault_id: $vault_id
+                }
+            )
+            MATCH (vault)-[:AG_HAS_SCOPE]->(source_scope:AGProtectionScope {
+                vault_id: $vault_id
+            })-[:AG_PROTECTS]->(source:AGScopedEntity {
+                vault_id: $vault_id
+            })
+            MATCH (source)-[link:AG_SCOPED_LINK {
+                vault_id: $vault_id
+            }]->(target:AGScopedEntity {
+                vault_id: $vault_id
+            })
+            MATCH (vault)-[:AG_HAS_SCOPE]->(target_scope:AGProtectionScope {
+                vault_id: $vault_id
+            })-[:AG_PROTECTS]->(target)
+            WHERE
+                link.relationship_id IN $relationship_ids
+                AND relationship_scope.scope_id = link.scope_id
+                AND relationship_scope.scope_id IN $allowed_scope_ids
+                AND relationship_scope.root_key_version = vault.key_version
+                AND source_scope.scope_id IN $allowed_scope_ids
+                AND source_scope.root_key_version = vault.key_version
+                AND target_scope.scope_id IN $allowed_scope_ids
+                AND target_scope.root_key_version = vault.key_version
+                AND source.scope_id = source_scope.scope_id
+                AND target.scope_id = target_scope.scope_id
+            WITH
+                relationship_scope,
+                source_scope,
+                source,
+                link,
+                target,
+                target_scope
+            ORDER BY link.relationship_id
+            LIMIT $relationship_fetch_limit
+            RETURN {
+                vault_id: link.vault_id,
+                scope_id: link.scope_id,
+                relationship_id: link.relationship_id,
+                record_revision: coalesce(link.record_revision, 1),
+                from_entity_id: source.entity_id,
+                from_scope_id: source_scope.scope_id,
+                to_entity_id: target.entity_id,
+                to_scope_id: target_scope.scope_id,
+                protection_scope_key_version:
+                    relationship_scope.scope_key_version,
+                payload_version: link.payload_version,
+                key_version: link.key_version,
+                algorithm: link.algorithm,
+                nonce: link.nonce,
+                ciphertext: link.ciphertext
+            } AS relationship_row
+        } AS relationships
+    """
+
     @staticmethod
     def _opaque_text(record: Any, name: str) -> str:
         value = Neo4jGraphRepository._record_text(record, name)
@@ -762,6 +951,27 @@ class Neo4jScopedGraphRepository(Neo4jGraphRepository):
             )
             and len(set(scope_ids)) == len(scope_ids)
         )
+
+    @staticmethod
+    def _valid_target_ids(values: object, *, maximum: int) -> bool:
+        if not isinstance(values, tuple) or len(values) > maximum:
+            return False
+        try:
+            return (
+                all(
+                isinstance(value, str)
+                and value
+                and len(value) <= MAX_OPAQUE_ID_CHARS
+                and not any(
+                    unicodedata.category(char).startswith("C")
+                    for char in value
+                )
+                    for value in values
+                )
+                and len(set(values)) == len(values)
+            )
+        except TypeError:
+            return False
 
     @staticmethod
     def _scope_envelope_parameters(
@@ -1565,6 +1775,78 @@ class Neo4jScopedGraphRepository(Neo4jGraphRepository):
             and self._record_integer(first, "deleted") == 1
         )
 
+    def delete_scoped_relationship_bundle(
+        self,
+        principal_id: str,
+        vault_id: str,
+        envelope_revision: int,
+        allowed_scope_ids: tuple[str, ...],
+        relationship_id: str,
+        expected_record_revision: int,
+        helper_entity_ids: tuple[str, ...],
+    ) -> bool:
+        if (
+            not self._valid_scope_ids(allowed_scope_ids)
+            or not self._valid_scope_ids((relationship_id,))
+            or not self._valid_record_revision(expected_record_revision)
+            or not isinstance(helper_entity_ids, tuple)
+            or not 1 <= len(helper_entity_ids) <= 2
+            or not self._valid_scope_ids(helper_entity_ids)
+        ):
+            return False
+        parameters = {
+            "principal_id": principal_id,
+            "vault_id": vault_id,
+            "envelope_revision": envelope_revision,
+            "allowed_scope_ids": list(allowed_scope_ids),
+            "relationship_id": relationship_id,
+            "expected_record_revision": expected_record_revision,
+            "helper_entity_ids": list(helper_entity_ids),
+        }
+
+        def bundle_is_absent() -> bool:
+            relationship_absent = (
+                self.get_scoped_relationship(
+                    principal_id,
+                    vault_id,
+                    envelope_revision,
+                    allowed_scope_ids,
+                    relationship_id,
+                )
+                is None
+            )
+            helpers_absent = all(
+                self.get_scoped_entity(
+                    principal_id,
+                    vault_id,
+                    envelope_revision,
+                    allowed_scope_ids,
+                    helper_entity_id,
+                )
+                is None
+                for helper_entity_id in helper_entity_ids
+            )
+            return relationship_absent and helpers_absent
+
+        try:
+            first = self._first(
+                self._execute(
+                    self._DELETE_SCOPED_RELATIONSHIP_BUNDLE,
+                    **parameters,
+                )
+            )
+        except IncompleteCommit:
+            if bundle_is_absent():
+                return True
+            raise
+        if first is not None:
+            return (
+                self._record_integer(first, "deleted") == 1
+                and self._record_integer(first, "helpers_deleted")
+                == len(helper_entity_ids)
+            )
+        return False
+
     def get_scoped_vault_snapshot(
         self,
         principal_id: str,
@@ -1614,6 +1896,100 @@ class Neo4jScopedGraphRepository(Neo4jGraphRepository):
         if (
             len(set(entity_ids)) != len(entity_ids)
             or len(set(relationship_ids)) != len(relationship_ids)
+            or any(
+                row.vault_id != vault_id
+                or row.scope_id not in allowed_scope_ids
+                for row in entities
+            )
+            or any(
+                row.vault_id != vault_id
+                or row.scope_id not in allowed_scope_ids
+                or from_scope_id not in allowed_scope_ids
+                or to_scope_id not in allowed_scope_ids
+                for row, from_scope_id, to_scope_id in relationship_results
+            )
+        ):
+            raise IntegrityViolation()
+        return ScopedEncryptedVaultSnapshotRow(
+            entities=entities,
+            relationships=relationships,
+        )
+
+    def get_scoped_targeted_snapshot(
+        self,
+        principal_id: str,
+        vault_id: str,
+        envelope_revision: int,
+        allowed_scope_ids: tuple[str, ...],
+        entity_ids: tuple[str, ...],
+        relationship_ids: tuple[str, ...],
+        *,
+        entity_limit: int,
+        relationship_limit: int,
+    ) -> ScopedEncryptedVaultSnapshotRow | None:
+        if (
+            type(entity_limit) is not int
+            or entity_limit <= 0
+            or type(relationship_limit) is not int
+            or relationship_limit <= 0
+        ):
+            raise ValueError("Targeted repository limits must be positive integers.")
+        if (
+            not self._valid_scope_ids(allowed_scope_ids)
+            or not self._valid_target_ids(
+                entity_ids,
+                maximum=entity_limit,
+            )
+            or not self._valid_target_ids(
+                relationship_ids,
+                maximum=relationship_limit,
+            )
+        ):
+            return None
+        first = self._first(
+            self._execute(
+                self._GET_SCOPED_TARGETED_SNAPSHOT,
+                principal_id=principal_id,
+                vault_id=vault_id,
+                envelope_revision=envelope_revision,
+                allowed_scope_ids=list(allowed_scope_ids),
+                entity_ids=list(entity_ids),
+                relationship_ids=list(relationship_ids),
+                entity_fetch_limit=entity_limit + 1,
+                relationship_fetch_limit=relationship_limit + 1,
+            )
+        )
+        if first is None:
+            return None
+
+        entities = tuple(
+            self._scoped_entity_from_record(record)
+            for record in self._record_list(first, "entities")
+        )
+        relationship_results = tuple(
+            self._scoped_relationship_from_record(record)
+            for record in self._record_list(first, "relationships")
+        )
+        relationships = tuple(result[0] for result in relationship_results)
+        returned_entity_ids = tuple(row.entity_id for row in entities)
+        returned_relationship_ids = tuple(
+            row.relationship_id for row in relationships
+        )
+        endpoint_ids = {
+            endpoint_id
+            for row in relationships
+            for endpoint_id in (row.from_entity_id, row.to_entity_id)
+        }
+        allowed_entity_ids = set(entity_ids) | endpoint_ids
+        if (
+            len(set(returned_entity_ids)) != len(returned_entity_ids)
+            or len(set(returned_relationship_ids))
+            != len(returned_relationship_ids)
+            or not set(returned_entity_ids).issubset(allowed_entity_ids)
+            or not set(returned_relationship_ids).issubset(
+                relationship_ids
+            )
+            or not endpoint_ids.issubset(returned_entity_ids)
             or any(
                 row.vault_id != vault_id
                 or row.scope_id not in allowed_scope_ids

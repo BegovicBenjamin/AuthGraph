@@ -5,6 +5,7 @@ import unittest
 from authgraph.authgraph import (
     PRIVATE_ENTITY_WRAPPER_KIND,
     PRIVATE_RELATIONSHIP_WRAPPER_KIND,
+    PUBLIC_ANCHOR_WRAPPER_KIND,
     AuthGraph,
 )
 from authgraph.crypto import CryptoEngine
@@ -26,7 +27,11 @@ from authgraph.models import (
     LockedDisclosure,
     ProtectionLevel,
 )
-from authgraph.retrieval import LayeredGraphViewProvider
+from authgraph.retrieval import (
+    DisclosurePolicy,
+    LayeredGraphViewProvider,
+    SessionVisibleGraphGateway,
+)
 from authgraph.scoped_service import ScopedAuthGraphService
 from authgraph.scoped_sessions import ScopedSessionBroker
 
@@ -394,7 +399,74 @@ class AuthGraphFacadeTests(unittest.TestCase):
             expected_revision=1,
         )
 
-    def test_public_crud_and_idempotency_are_explicitly_unsupported(self) -> None:
+    def test_public_entity_crud_and_idempotent_create(self) -> None:
+        first = self.graph.create_entity(
+            "support",
+            "Product",
+            {"name": "Headphones"},
+            protection=ProtectionLevel.PUBLIC,
+            publisher=self.publisher,
+            idempotency_key="public-product-1001",
+        )
+        replay = self.graph.create_entity(
+            "support",
+            "Product",
+            {"name": "Headphones"},
+            protection=ProtectionLevel.PUBLIC,
+            publisher=self.publisher,
+            idempotency_key="public-product-1001",
+        )
+        self.assertEqual(replay, first)
+        self.assertIn("public_entity_", first.entity_id)
+
+        with self.assertRaises(ConflictError):
+            self.graph.create_entity(
+                "support",
+                "Product",
+                {"name": "Different"},
+                protection=ProtectionLevel.PUBLIC,
+                publisher=self.publisher,
+                idempotency_key="public-product-1001",
+            )
+
+        current = self.graph.get_entity("support", first)
+        self.assertEqual(current.record_revision, 1)
+        updated = self.graph.update_entity(
+            "support",
+            first,
+            "Product",
+            {"name": "Headphones v2"},
+            expected_revision=1,
+            publisher=self.publisher,
+        )
+        self.assertEqual(updated.record_revision, 2)
+        self.assertEqual(updated.properties["name"], "Headphones v2")
+        with self.assertRaises(ConflictError):
+            self.graph.update_entity(
+                "support",
+                first,
+                "Product",
+                {"name": "stale"},
+                expected_revision=1,
+                publisher=self.publisher,
+            )
+        with self.assertRaises(AuthorizationDenied):
+            self.graph.delete_entity(
+                "support",
+                first,
+                expected_revision=2,
+                publisher=object(),
+            )
+        self.graph.delete_entity(
+            "support",
+            first,
+            expected_revision=2,
+            publisher=self.publisher,
+        )
+        with self.assertRaises(RecordNotFound):
+            self.graph.get_entity("support", first)
+
+    def test_public_relationship_crud_and_idempotent_create(self) -> None:
         first = self.graph.create_entity(
             "support",
             "Product",
@@ -414,41 +486,74 @@ class AuthGraphFacadeTests(unittest.TestCase):
             first,
             second,
             "RELATED_TO",
+            {"rank": 1},
             protection=ProtectionLevel.PUBLIC,
             publisher=self.publisher,
+            idempotency_key="public-relationship-1001",
         )
+        replay = self.graph.connect(
+            "support",
+            first,
+            second,
+            "RELATED_TO",
+            {"rank": 1},
+            protection=ProtectionLevel.PUBLIC,
+            publisher=self.publisher,
+            idempotency_key="public-relationship-1001",
+        )
+        self.assertEqual(replay, relationship)
+        self.assertIn("public_relationship_", relationship.relationship_id)
+        resolved = self.graph.get_relationship("support", relationship)
+        self.assertEqual(resolved.from_entity_id, first.entity_id)
+        self.assertEqual(resolved.to_entity_id, second.entity_id)
+        self.assertEqual(resolved.record_revision, 1)
 
-        with self.assertRaisesRegex(ValidationError, "updates"):
-            self.graph.update_entity(
+        with self.assertRaises(ConflictError):
+            self.graph.connect(
                 "support",
                 first,
-                "Product",
-                {"name": "new"},
-                context=None,  # type: ignore[arg-type]
-                expected_revision=1,
+                second,
+                "RELATED_TO",
+                {"rank": 2},
+                protection=ProtectionLevel.PUBLIC,
+                publisher=self.publisher,
+                idempotency_key="public-relationship-1001",
             )
-        with self.assertRaisesRegex(ValidationError, "deletion"):
+
+        updated = self.graph.update_relationship(
+            "support",
+            relationship,
+            "RELATED_TO",
+            {"rank": 2},
+            expected_revision=1,
+            publisher=self.publisher,
+        )
+        self.assertEqual(updated.record_revision, 2)
+        self.assertEqual(updated.properties["rank"], 2)
+        with self.assertRaises(ConflictError):
             self.graph.delete_entity(
                 "support",
                 first,
-                context=None,  # type: ignore[arg-type]
                 expected_revision=1,
+                publisher=self.publisher,
             )
-        with self.assertRaisesRegex(ValidationError, "lookup"):
+        self.graph.delete_relationship(
+            "support",
+            relationship,
+            expected_revision=2,
+            publisher=self.publisher,
+        )
+        with self.assertRaises(RecordNotFound):
             self.graph.get_relationship(
                 "support",
                 relationship,
-                context=None,  # type: ignore[arg-type]
             )
-        with self.assertRaisesRegex(ValidationError, "idempotent"):
-            self.graph.create_entity(
-                "support",
-                "Product",
-                {},
-                protection=ProtectionLevel.PUBLIC,
-                publisher=self.publisher,
-                idempotency_key="not-supported",
-            )
+        self.graph.delete_entity(
+            "support",
+            first,
+            expected_revision=1,
+            publisher=self.publisher,
+        )
 
     def test_scope_limited_view_omits_locked_endpoint_and_edge(self) -> None:
         all_scopes = self.unlock(self.scope_a, self.scope_b)
@@ -672,7 +777,113 @@ class AuthGraphFacadeTests(unittest.TestCase):
         self.assertEqual(view.relationships[0].from_entity_id, private.entity_id)
         self.assertEqual(view.relationships[0].to_entity_id, public.entity_id)
 
-    def test_mixed_idempotency_rejection_creates_no_partial_anchor(self) -> None:
+        before_delete = self.private_repository.ciphertext_snapshot()
+        with self.assertRaises(ConflictError):
+            self.graph.delete_relationship(
+                "support",
+                relationship,
+                context=context,
+                expected_revision=2,
+            )
+        self.assertEqual(
+            self.private_repository.ciphertext_snapshot(),
+            before_delete,
+        )
+        self.graph.delete_relationship(
+            "support",
+            relationship,
+            context=context,
+            expected_revision=1,
+        )
+        deleted = self.private_repository.ciphertext_snapshot()
+        self.assertEqual(len(deleted["scoped_entities"]), 1)
+        self.assertEqual(len(deleted["scoped_relationships"]), 0)
+
+    def test_targeted_retrieval_resolves_mixed_anchor_and_current_public_row(
+        self,
+    ) -> None:
+        context = self.unlock(self.scope_a)
+        private = self.graph.create_entity(
+            "support",
+            "Order",
+            {"status": "delayed"},
+            context=context,
+            scope_id=self.scope_a,
+        )
+        public = self.graph.create_entity(
+            "support",
+            "Product",
+            {"name": "Headphones"},
+            protection=ProtectionLevel.PUBLIC,
+            publisher=self.publisher,
+        )
+        relationship = self.graph.connect(
+            "support",
+            private,
+            public,
+            "CONTAINS",
+            context=context,
+            scope_id=self.scope_a,
+        )
+        gateway = SessionVisibleGraphGateway(
+            self.graph,
+            graph_id="support",
+            policy=DisclosurePolicy(
+                allowed_entity_kinds=frozenset({"Order", "Product"}),
+                allowed_relationship_kinds=frozenset({"CONTAINS"}),
+                entity_property_allowlist={
+                    "Order": frozenset({"status"}),
+                    "Product": frozenset({"name"}),
+                },
+                relationship_property_allowlist={
+                    "CONTAINS": frozenset(),
+                },
+                max_nodes=5,
+                max_edges=5,
+                max_hops=1,
+            ),
+        )
+        baseline = gateway.retrieve("delayed", context=context)
+        index = gateway.build_candidate_index(context=context)
+        self.addCleanup(index.close)
+
+        result = gateway.retrieve(
+            "delayed",
+            context=context,
+            candidate_index=index,
+        )
+        self.assertEqual(result, baseline)
+        self.assertEqual(
+            [entity.entity_id for entity in result.entities],
+            [private.entity_id, public.entity_id],
+        )
+        self.assertEqual(
+            [row.relationship_id for row in result.relationships],
+            [relationship.relationship_id],
+        )
+        self.assertEqual(
+            result.relationships[0].to_entity_id,
+            public.entity_id,
+        )
+
+        self.graph.delete_entity(
+            "support",
+            public,
+            expected_revision=1,
+            publisher=self.publisher,
+        )
+        stale_result = gateway.retrieve(
+            "delayed",
+            context=context,
+            candidate_index=index,
+        )
+        self.assertEqual(
+            [entity.entity_id for entity in stale_result.entities],
+            [private.entity_id],
+        )
+        self.assertEqual(stale_result.relationships, ())
+
+    def test_mixed_idempotency_replays_and_rejects_altered_intent(self) -> None:
         context = self.unlock(self.scope_a)
         private = self.graph.create_entity(
             "support",
@@ -688,20 +899,284 @@ class AuthGraphFacadeTests(unittest.TestCase):
             protection=ProtectionLevel.PUBLIC,
             publisher=self.publisher,
         )
-        before = self.private_repository.ciphertext_snapshot()
-        with self.assertRaisesRegex(ValidationError, "Idempotent creation"):
+        first = self.graph.connect(
+            "support",
+            private,
+            public,
+            "CONTAINS",
+            {"quantity": 1},
+            context=context,
+            scope_id=self.scope_a,
+            idempotency_key="mixed-edge",
+        )
+        before_replay = self.private_repository.ciphertext_snapshot()
+        replay = self.graph.connect(
+            "support",
+            private,
+            public,
+            "CONTAINS",
+            {"quantity": 1},
+            context=context,
+            scope_id=self.scope_a,
+            idempotency_key="mixed-edge",
+        )
+        self.assertEqual(replay, first)
+        self.assertEqual(
+            self.private_repository.ciphertext_snapshot(),
+            before_replay,
+        )
+
+        with self.assertRaises(ConflictError):
             self.graph.connect(
                 "support",
                 private,
                 public,
                 "CONTAINS",
+                {"quantity": 2},
+                context=context,
+                scope_id=self.scope_a,
+                idempotency_key="mixed-edge",
+            )
+        other_public = self.graph.create_entity(
+            "support",
+            "Product",
+            {},
+            protection=ProtectionLevel.PUBLIC,
+            publisher=self.publisher,
+        )
+        with self.assertRaises(ConflictError):
+            self.graph.connect(
+                "support",
+                private,
+                other_public,
+                "CONTAINS",
+                {"quantity": 1},
                 context=context,
                 scope_id=self.scope_a,
                 idempotency_key="mixed-edge",
             )
         self.assertEqual(
             self.private_repository.ciphertext_snapshot(),
+            before_replay,
+        )
+
+    def test_private_edge_public_self_loop_reuses_one_idempotent_anchor(
+        self,
+    ) -> None:
+        context = self.unlock(self.scope_a)
+        public = self.graph.create_entity(
+            "support",
+            "Product",
+            {},
+            protection=ProtectionLevel.PUBLIC,
+            publisher=self.publisher,
+        )
+        first = self.graph.connect(
+            "support",
+            public,
+            public,
+            "RELATED_TO_SELF",
+            context=context,
+            scope_id=self.scope_a,
+            idempotency_key="public-self-loop",
+        )
+        replay = self.graph.connect(
+            "support",
+            public,
+            public,
+            "RELATED_TO_SELF",
+            context=context,
+            scope_id=self.scope_a,
+            idempotency_key="public-self-loop",
+        )
+        self.assertEqual(replay, first)
+        stored = self.private_repository.ciphertext_snapshot()
+        self.assertEqual(len(stored["scoped_entities"]), 1)
+        self.assertEqual(len(stored["scoped_relationships"]), 1)
+
+        self.graph.delete_relationship(
+            "support",
+            first,
+            context=context,
+            expected_revision=1,
+        )
+        deleted = self.private_repository.ciphertext_snapshot()
+        self.assertEqual(len(deleted["scoped_entities"]), 0)
+        self.assertEqual(len(deleted["scoped_relationships"]), 0)
+
+    def test_private_edge_between_public_entities_uses_two_anchors(
+        self,
+    ) -> None:
+        context = self.unlock(self.scope_a)
+        first_public = self.graph.create_entity(
+            "support",
+            "Product",
+            {"name": "First"},
+            protection=ProtectionLevel.PUBLIC,
+            publisher=self.publisher,
+        )
+        second_public = self.graph.create_entity(
+            "support",
+            "Product",
+            {"name": "Second"},
+            protection=ProtectionLevel.PUBLIC,
+            publisher=self.publisher,
+        )
+        first = self.graph.connect(
+            "support",
+            first_public,
+            second_public,
+            "RELATED_TO",
+            context=context,
+            scope_id=self.scope_a,
+            idempotency_key="two-public-anchors",
+        )
+        replay = self.graph.connect(
+            "support",
+            first_public,
+            second_public,
+            "RELATED_TO",
+            context=context,
+            scope_id=self.scope_a,
+            idempotency_key="two-public-anchors",
+        )
+        self.assertEqual(replay, first)
+        stored = self.private_repository.ciphertext_snapshot()
+        self.assertEqual(len(stored["scoped_entities"]), 2)
+        self.assertEqual(len(stored["scoped_relationships"]), 1)
+
+        self.graph.delete_relationship(
+            "support",
+            first,
+            context=context,
+            expected_revision=1,
+        )
+        deleted = self.private_repository.ciphertext_snapshot()
+        self.assertEqual(len(deleted["scoped_entities"]), 0)
+        self.assertEqual(len(deleted["scoped_relationships"]), 0)
+
+    def test_deleted_public_endpoint_hides_and_can_clean_up_mixed_edge(
+        self,
+    ) -> None:
+        context = self.unlock(self.scope_a)
+        private = self.graph.create_entity(
+            "support",
+            "Order",
+            {},
+            context=context,
+            scope_id=self.scope_a,
+        )
+        public = self.graph.create_entity(
+            "support",
+            "Product",
+            {},
+            protection=ProtectionLevel.PUBLIC,
+            publisher=self.publisher,
+        )
+        relationship = self.graph.connect(
+            "support",
+            private,
+            public,
+            "CONTAINS",
+            context=context,
+            scope_id=self.scope_a,
+        )
+        self.graph.delete_entity(
+            "support",
+            public,
+            expected_revision=1,
+            publisher=self.publisher,
+        )
+
+        view = self.graph.get_unlocked_view("support", context)
+        self.assertEqual(
+            [entity.entity_id for entity in view.entities],
+            [private.entity_id],
+        )
+        self.assertEqual(view.relationships, ())
+        with self.assertRaises(RecordNotFound):
+            self.graph.get_relationship(
+                "support",
+                relationship,
+                context=context,
+            )
+
+        self.graph.delete_relationship(
+            "support",
+            relationship,
+            context=context,
+            expected_revision=1,
+        )
+        deleted = self.private_repository.ciphertext_snapshot()
+        self.assertEqual(len(deleted["scoped_entities"]), 1)
+        self.assertEqual(len(deleted["scoped_relationships"]), 0)
+
+    def test_mixed_delete_leaves_everything_when_anchor_is_shared(
+        self,
+    ) -> None:
+        context = self.unlock(self.scope_a)
+        private = self.graph.create_entity(
+            "support",
+            "Order",
+            {},
+            context=context,
+            scope_id=self.scope_a,
+        )
+        other_private = self.graph.create_entity(
+            "support",
+            "Order",
+            {},
+            context=context,
+            scope_id=self.scope_a,
+        )
+        public = self.graph.create_entity(
+            "support",
+            "Product",
+            {},
+            protection=ProtectionLevel.PUBLIC,
+            publisher=self.publisher,
+        )
+        relationship = self.graph.connect(
+            "support",
+            private,
+            public,
+            "CONTAINS",
+            context=context,
+            scope_id=self.scope_a,
+        )
+        snapshot = self.protected.get_vault_snapshot(context)
+        anchor = next(
+            entity
+            for entity in snapshot.entities
+            if entity.kind == PUBLIC_ANCHOR_WRAPPER_KIND
+        )
+        self.protected.connect(
+            context,
+            self.scope_a,
+            anchor.entity_id,
+            other_private.entity_id,
+            "RAW_SHARED_ANCHOR",
+        )
+        before = self.private_repository.ciphertext_snapshot()
+
+        with self.assertRaises(ConflictError):
+            self.graph.delete_relationship(
+                "support",
+                relationship,
+                context=context,
+                expected_revision=1,
+            )
+        self.assertEqual(
+            self.private_repository.ciphertext_snapshot(),
             before,
+        )
+        self.assertEqual(
+            self.graph.get_relationship(
+                "support",
+                relationship,
+                context=context,
+            ).kind,
+            "CONTAINS",
         )
 
     def test_raw_scoped_records_are_not_reinterpreted(self) -> None:

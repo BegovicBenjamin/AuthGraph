@@ -23,8 +23,11 @@ compliance.
 5. Modification or truncation of a present ciphertext, record swapping, or
    cross-vault movement fails authenticated decryption.
 6. Expiry, logout, password change, and session revocation prevent the affected
-   session from obtaining a new key lease in the supported single-process
-   design. Session revocation does not disable a future valid unlock.
+   session from obtaining a new key lease inside the selected broker's
+   coordination boundary. New opens and leases require `ACTIVE` at the exact
+   envelope revision; interrupted changes remain fail-closed until trusted
+   reconciliation. Session revocation alone does not disable a future valid
+   unlock.
 7. A v2 private relationship is visible only when its relationship scope and
    both endpoint scopes are granted.
 
@@ -74,8 +77,12 @@ snapshot rollback. Strong anti-rollback protection needs a monotonic version or
 transparency record in a trusted system outside Neo4j and its backups.
 
 Managed runtimes such as Python cannot guarantee complete memory zeroization.
-This prototype overwrites mutable buffers on a best-effort basis, never
-serializes raw DEKs, and intentionally locks all vaults on process restart.
+This prototype overwrites mutable buffers on a best-effort basis and never
+serializes raw DEKs. The default in-memory brokers invalidate sessions on
+restart. The durable broker stores no plaintext session token or scope key. It
+stores token HMAC digests, provider-wrapped scope keys, lifecycle/guard
+metadata, and expiry-bound lease rows. A durable session survives restart only
+while unexpired, unrevoked, and bound to the exact `ACTIVE` revision.
 
 ## Key hierarchy
 
@@ -96,11 +103,13 @@ a fresh nonce. AAD binds its owner, vault, scope, object ID, version, and—for 
 relationship—direction, endpoints, and endpoint scopes.
 
 AuthGraph stores neither the password nor raw keys in Neo4j. Password change
-unwraps and re-wraps the same vault key, increments the authorization epoch,
-revokes older local sessions, and makes older grants unusable at provider
-unlock; those grant objects remain in the in-memory policy until consumption
-or expiry. Scope keys and record ciphertext do not change. The caller still
-owns and must dispose of the passphrase input.
+first prepares `REVISION_PENDING` and revokes existing sessions, then
+compare-and-swaps the Neo4j envelope. After that commit it finalizes
+`ACTIVE(next_revision)`. An interruption leaves the vault pending;
+`reconcile_passphrase_change()` reads the authoritative graph revision and
+accepts only the recorded current or next revision. Older grants become
+unusable at provider unlock. Scope keys and record ciphertext do not change.
+The caller still owns and must dispose of the passphrase input.
 
 Re-wrapping is not cryptographic recovery from compromise. Anyone who copied a
 vault or scope key keeps the corresponding decrypt capability. Suspected key
@@ -114,9 +123,15 @@ This has two important consequences:
   stop offline attacks. A production design should consider a second
   server/HSM-controlled factor.
 - With no enrolled alternative provider or recovery wrap, losing the password
-  or corrupting key metadata can permanently lose the data. A break-glass or
-  recovery key is a product, governance, and legal decision—not something to
-  improvise later.
+  or corrupting key metadata can permanently lose the data.
+  `MirroredKeyWrappingBackend` is an independent-wrap building block, not a
+  complete recovery product. Break-glass approval, custody, audit, drills, and
+  immediate rewrap remain application and governance responsibilities.
+
+Routine `MirroredKeyWrappingBackend.unwrap_key()` uses the primary backend only
+and never falls back to recovery. Recovery is a separate explicit operation,
+allowed only after consuming an exact single-use recovery grant. It records
+pseudonymous source provenance and rewraps into a different provider generation.
 
 ## Owner and delegated access
 
@@ -137,8 +152,9 @@ other PII as `principal_id` or `vault_id`.
 Legacy v1 still has one private DEK, so a live v1 context can decrypt the whole
 private vault. V2 creates cryptographic compartments with independent scope
 DEKs. It does not yet implement delegated principals, shared key slots,
-migration, or key rotation. The broader design is in
-[CHATBOT_GRAPHRAG_DESIGN.md](CHATBOT_GRAPHRAG_DESIGN.md).
+automatic legacy encrypted-data migration, or scope-key rotation. Packaged
+Neo4j schema-version migrations are a separate mechanism. The broader design
+is in [CHATBOT_GRAPHRAG_DESIGN.md](CHATBOT_GRAPHRAG_DESIGN.md).
 
 ## Layered public graph and private overlays
 
@@ -219,16 +235,26 @@ Policies are in-process startup configuration, not persisted or revisioned
 security records. Changing them affects future writes and the badge only. Each
 private edge involving a public endpoint currently creates an encrypted helper
 anchor. New anchors and their relationship are committed atomically, so a
-failed write leaves neither. Successful connections can still create duplicate
-anchors, and anchors count toward the snapshot limit. Production needs a
-deduplicated external-reference design.
+failed write leaves neither. An idempotent replay reuses its helpers, but
+separate logical creates can still produce duplicate anchors, and anchors count
+toward the snapshot limit. Helper deletion is atomic only when they are not
+shared; unexpected sharing fails closed.
+
+The public repository cannot inspect encrypted private references. Deleting a
+public endpoint can therefore leave an encrypted anchor and edge. Unlocked
+composition hides that unresolved edge, and a trusted private-relationship
+delete can later remove the edge and unshared helper. Applications need a
+cross-store deletion/cleanup policy; a future deduplicated external-reference
+design would reduce this gap.
 
 ## Required host-application unlock and session flow
 
 The Python library implements key envelopes, password unlock, scoped sessions,
-an in-memory OTP challenge broker, fixed one-time-code profiles, and a
-scope-key-provider interface. It does not implement login, HTTP, cookies,
-password/code forms, email delivery, passkeys, or a production KMS adapter.
+OTP challenges, fixed one-time-code profiles, a scope-key-provider interface,
+an injected-client AWS KMS wrapping adapter, durable slot-store SPI, and
+optional SQLite references for OTP, grant, session, and key-slot state. It does
+not implement login, HTTP, cookies, password/code forms, email delivery,
+passkeys, KMS credentials/policy, or a shared multi-host authorization service.
 
 ```text
 1. User authenticates to the application, preferably with MFA/passkeys.
@@ -242,40 +268,59 @@ password/code forms, email delivery, passkeys, or a production KMS adapter.
 7. Temporary mutable KEK/DEK buffers owned by the broker are cleared
    best-effort. The HTTP/caller layer is responsible for disposing of its
    passphrase input buffer.
-8. Only the selected key material enters a short-lived in-memory session bound
-   to principal + vault.
+8. Only the selected key material enters a short-lived scoped session bound to
+   principal + vault. The default broker holds it in memory; the durable
+   single-host broker persists token digests, provider-wrapped session keys,
+   lifecycle/guard metadata, and expiry-bound lease rows, never plaintext keys.
 9. The browser receives a high-entropy opaque cookie, never a key or the
    internal `AccessContext`.
 10. Every fixed graph operation obtains its vault and scope authority from that
     server session, not from user text or model-selected arguments.
-11. Logout, timeout, password change, revocation, or restart prevents a future
-    operation from acquiring a session key lease.
+11. Session creation and every new key lease require `ACTIVE` at the exact
+    envelope revision. Logout, timeout, password change, or session revocation
+    prevents the affected session from taking another lease. A provider-slot
+    tombstone prevents future provider release, not direct passphrase unlock.
+    Restart invalidates in-memory sessions; a valid durable session
+    intentionally survives a same-host restart.
 ```
 
 A one-time code must not be used as a KEK or entered in chatbot text. The
-in-memory broker stores only an HMAC-keyed verifier, limits attempts, binds the
-challenge to the principal, profile, opaque vault context, browser transaction,
-and current authorization epoch, and produces broker-held evidence that can be
-consumed exactly once.
+brokers store only HMAC-keyed verifiers, limit attempts, bind the challenge to
+the principal, profile, opaque vault context, browser transaction, and current
+authorization epoch, and produce evidence that can be consumed exactly once.
+The durable broker adds a stable verifier key, issuance limits, and atomic
+SQLite transitions across local processes; it stores neither plaintext codes
+nor raw evidence capabilities.
 The fixed policy then creates a single-use scope grant.
 
-The code only authorizes a trusted provider to release keys. The included
-`InMemoryScopeKeyProvider` uses a random process-local wrap for tests, holds a
-release lease until session creation completes, and loses all capability on
-shutdown. Compromise of that process can expose every enrolled scope, so it is
-not production custody. Its scope/vault revocation methods remove future
-release capability but do not revoke an already opened AuthGraph session; the
-host must revoke both. A real deployment needs KMS/HSM-backed enrollment and
-release plus external issuance rate limits.
+The code only authorizes a trusted provider to release keys.
+`InMemoryScopeKeyProvider` is a process-local test helper.
+`EnvelopeScopeKeyProvider` composes a provider wrapping backend with atomic key
+slots; the included AWS KMS adapter accepts an already authenticated client,
+and `SqliteKeySlotStore` is durable on one host. Production still requires
+correct provider credentials and key policies, a shared strongly consistent
+slot store for multiple hosts, issuance limits, monitoring, and reviewed
+lifecycle operations.
+
+Coordinated management commits a required audit intent, enters `BLOCKED` under
+the same per-vault fence used by provider unlock, revokes existing sessions,
+and keeps that fence through provider mutation. A provider unlock cannot mint a
+session after blocking begins. A key already leased or copied before the fence
+may still finish and cannot be recalled. Suspected scope-key compromise still
+requires data-key rotation and record re-encryption, which is not automated.
+Provider-slot tombstones do not disable the separate passphrase-unlock path;
+the host must remove that credential path when its policy requires global
+access revocation.
 
 Email is only one possible host delivery channel. It is lower assurance and is
 not accepted as out-of-band authentication by current NIST digital identity
 guidance. Prefer passkeys or an identity provider with MFA for sensitive
 deployments.
 
-Expiry is enforced synchronously whenever a token asks for a lease. The broker
-also sweeps and best-effort zeroes expired resident DEKs every second by
-default, and removes them opportunistically on another session open. The sweep
+The in-memory session broker enforces expiry synchronously whenever a token
+asks for a lease. It also sweeps and best-effort zeroes expired resident DEKs
+every second by default, and removes them opportunistically on another session
+open. The sweep
 interval is bounded between 10 milliseconds and 60 seconds to prevent both a
 tight-loop configuration and unbounded post-expiry residency; disabling it is
 intended only for deterministic tests. If the worker fails unexpectedly, the
@@ -288,14 +333,50 @@ leased to an in-flight operation may live until that operation's `finally`
 block completes. Local lifecycle operations do not preempt that work; the
 vault guard makes logout or password change wait until it finishes.
 
-The local striped lock, envelope compare-and-swap, and broker revision fence
-close password-change races inside one process, including multiple service
-objects sharing that broker. Separate brokers in separate replicas do not
-share revision state. A production multi-replica deployment therefore needs a
-hardened shared broker or distributed fencing/revocation protocol.
-The prototype also places a configurable hard cap on tracked vault revisions
-and fails closed when full; production should keep this authority in bounded,
-durable shared state.
+Every vault has one fenced lifecycle state:
+
+- `ACTIVE(current_revision)` admits new sessions and leases only at that exact
+  revision.
+- `REVISION_PENDING(current_revision, next_revision)` is written before a
+  passphrase-envelope compare-and-swap and survives an interruption.
+- `BLOCKED(current_revision, generation)` is written before revocation,
+  provider rewrap, or recovery mutation and survives an interruption.
+
+`REVISION_PENDING` is reconciled only from Neo4j's authoritative envelope
+revision. `BLOCKED` is cleared only after an operator verifies provider,
+session, graph, and audit state and supplies the exact blocked generation.
+Reconciliation is a trusted backend/operator action, never a chatbot tool.
+
+`DurableScopedSessionBroker` uses SQLite transactions plus heartbeat-renewed,
+monotonic generation-fenced guards across processes sharing one local file. A
+worker that loses its guard cannot commit protected lifecycle work. Each active
+key lease has an expiry-bound row; after a worker crash, purge can reclaim stale
+rows and remove revoked wrapped-session ciphertext. This cannot recall a
+plaintext copy already held by a process. `close_all()` closes only that broker
+handle and does not revoke persisted sessions.
+
+The in-memory broker's striped lock and revision fence close password-change
+races for service objects sharing that broker. Separate in-memory brokers do not
+share state. Durable brokers sharing one SQLite file do coordinate local worker
+processes, but a production multi-host deployment still needs a hardened shared
+broker or distributed fencing/revocation protocol. The in-memory broker also
+caps tracked vault lifecycle rows and fails closed when full.
+
+The optional SQLite OTP, grant, session, and slot stores extend this boundary
+to processes on one machine, not to multiple application hosts. A multi-host
+deployment must replace each with shared transactional state that preserves
+atomic consume, fencing, expiry, revocation, and bounded-capacity behavior.
+
+`SecurityAuditLogger` writes only HMAC-pseudonymized references and allowlisted
+metadata. Management operations commit a required `PENDING` audit intent before
+their first mutation, then a linked `SUCCEEDED` or `FAILED` outcome. A successful
+mutation records its outcome while the vault is still blocked and only then
+restores access. `verify_json_lines_audit_report()` verifies the hash
+chain and reports unmatched pending operation references. A pending reference
+means the result is ambiguous and authoritative state must be inspected before
+reconciliation or retry. `JsonLinesAuditSink` remains a local reference, not
+WORM storage or a multi-host audit service; audit and state are not one
+distributed transaction.
 
 A future HTTP layer must use `Secure`, `HttpOnly`, and appropriate `SameSite`
 cookies, CSRF protection, session rotation, a strict content-security policy,
@@ -339,8 +420,10 @@ The separate public adapter likewise exposes only fixed, graph-scoped query
 templates. It stores properties as canonical plaintext JSON and never queries
 private labels. Public graph IDs and public object IDs are opaque, bounded
 values supplied as parameters rather than interpolated into Cypher. Cooperative
-public writes and bounded snapshots take the same transient public-graph lock
-so a snapshot cannot pair a new relationship with an older entity collection.
+public writes, optimistic updates/deletes, and bounded snapshots take the same
+transient public-graph lock so a snapshot cannot pair a new relationship with
+an older entity collection. `AuthGraph` requires trusted publisher
+authorization for every public write.
 
 The adapter treats an exact row already present after a zero-row write or
 `IncompleteCommit` as a successful retry. If it cannot verify the exact row,
@@ -349,9 +432,12 @@ Private create methods also accept an application idempotency key. AuthGraph
 derives a stable opaque object ID with HMAC-SHA256 under the selected scope key;
 the raw idempotency key is not stored. An exact replay returns the same ID,
 while reusing the key with changed semantics, scope, endpoints, or direction
-fails. Creates without a key still generate a new random ID. Public and mixed
-anchor-edge idempotency are not implemented. The schema requires globally
-unique entity and relationship IDs.
+fails. Public creates derive a stable ID from SHA-256 over the operation,
+graph, and opaque retry key; mixed anchor-edge bundles use the protected scope
+path. Exact replays are retry-safe and changed intent conflicts. Creates
+without a key still generate a new random ID. Public retry keys are not secret
+authentication evidence and should contain no PII or credentials. The schema
+requires globally unique entity and relationship IDs.
 
 Protected writes take an explicit temporary-property lock on the vault before
 reading its envelope revision. This is required because Neo4j's default
@@ -373,8 +459,9 @@ read-only check. Production must prevent untrusted direct graph writes and use
 Enterprise existence/key constraints where available.
 
 These queries have recording-driver unit tests and an opt-in live integration
-suite. The live suite has not completed in this workspace because the Docker
-host had no free disk space; this is still a release blocker before real data.
+suite. A CI matrix is configured for explicit Neo4j compatibility points, but
+configuration alone is not a passing result. Check the live result for the
+exact commit, driver, and server version before release.
 
 Neo4j/Aura storage encryption, TLS, RBAC, PBAC, private networking, backups,
 and audit controls remain important defense in depth. They are not a
@@ -404,12 +491,24 @@ accepts question text. Do not register the backend
 `SessionVisibleGraphGateway.retrieve()` method directly because it also has
 trusted-only parameters.
 
-The current main facade first decrypts a bounded complete snapshot of every
-scope granted to the session in trusted memory and selects wrappers for the
-requested encrypted `graph_id`. The gateway then projects
-allowed kinds and properties, ranks lexical and optional vector seeds,
-performs bounded traversal, and returns provenance. This reduces model
-disclosure but is not yet repository-native targeted retrieval. Its canonical
+The default private retrieval path first decrypts a bounded complete snapshot
+of every scope granted to the session in trusted memory. The optional
+`SessionCandidateIndex` also starts with one complete policy-projected view,
+then retains allowlisted lexical token counts and opaque semantic topology in
+process. These token derivatives remain sensitive even though the index does
+not keep the original property mapping.
+
+Repeated searches with that exact gateway/context-bound index rank candidates
+in process and use a fixed, revision- and scope-fenced repository query to read
+only the selected current ciphertext rows and granted relationship endpoints.
+A closed, expired, or wrong-context index fails and never becomes a public-only
+fallback. Candidate tokens/topology are build-time state, so discovery may be
+stale until rebuild. This reduces repeated full-snapshot decryption but does
+not make encrypted properties semantically searchable in Neo4j and does not
+remove the initial complete in-process projection.
+
+The gateway projects allowed kinds and properties, ranks lexical and optional
+vector seeds, performs bounded traversal, and returns provenance. Its canonical
 serialized byte limit covers the complete returned payload. Its token value is
 only a deterministic byte-based estimate; the host must apply the actual
 selected model tokenizer and final prompt budget.
@@ -430,18 +529,18 @@ value. Once returned, however, all decrypted entities and relationships are
 caller-owned plaintext; passing that snapshot directly to an LLM exposes the
 whole snapshot to the model environment. It must not be offered as a
 model-selectable tool. The current gateway filters the eventual model result,
-while future repository-native retrieval should also minimize plaintext inside
-the trusted process.
+while future storage-native candidate discovery should further minimize
+plaintext inside the trusted process.
 Its all-or-nothing guarantee covers the rows visible to the scoped repository
 query and the configured bounds. It cannot detect a hostile storage actor that
 deletes a row or removes the label, vault metadata, or ownership edge needed
 to make that row query-visible; that requires an authenticated inventory
 outside the mutable graph.
 
-The current private API has revision-checked update and restrictive physical
-delete operations. Public mutation after creation, encrypted embedding
-storage/loading, hosted model integration, and an AI write policy are not
-implemented. The temporary vector index is caller-managed and must be closed
+The current facade has revision-checked public/private updates and restrictive
+physical deletes. Classification changes, encrypted embedding storage/loading,
+hosted model integration, and an AI write policy are not implemented. The
+temporary vector and candidate indexes are caller-managed and must be closed
 before or with the secure session; automatic lifecycle binding is not
 implemented.
 
@@ -456,7 +555,8 @@ The included unit tests cover the first layer:
 - ciphertext tampering and object-swapping detection;
 - encrypted relationship round trips;
 - bounded all-or-nothing vault snapshots and cross-owner snapshot isolation;
-- password re-wrapping and session revocation;
+- fail-closed password re-wrapping, crash-sticky pending state, exact trusted
+  reconciliation, and session revocation;
 - compare-and-swap envelope updates and a forced stale-unlock race;
 - invalid/non-finite TTL rejection and strict storage-metadata decoding;
 - in-flight lifecycle serialization, concurrent shutdown/key-zeroization
@@ -479,14 +579,27 @@ The included unit tests cover the first layer:
   entity deletion, and relationship CRUD across all required scopes;
 - HMAC-derived private idempotent creates, exact replay, changed-intent
   rejection, and atomic scoped helper bundles;
+- publisher-authorized public CRUD, optimistic revisions, deterministic public
+  idempotency, mixed-edge idempotent bundles, and unshared helper cleanup;
 - packaged schema application and exact constraint/index verification;
 - OTP attempt, expiry, resend, concurrency, evidence-forgery, and replay
   behavior;
+- restart-safe SQLite OTP/grant consumption and cross-process single-winner
+  behavior on one host;
 - fixed scope profiles, provider release, authorization-epoch invalidation,
-  expiry-during-release, and provider-close ordering; and
+  expiry-during-release, and provider-close ordering;
+- durable same-host session restart, cross-worker logout/revocation, exact
+  revision fencing, heartbeat guard renewal/stale-owner rejection, crashed-lease
+  cleanup, and provider-wrapped resident keys;
+- key-slot compare-and-swap, exact-scope release, tombstones, provider-key
+  rewrap, injected-client AWS KMS behavior, primary-only routine unwrap,
+  explicitly authorized recovery/provenance, crash-sticky blocked operations,
+  pseudonymous hash-chained audit intents/outcomes, and unmatched-intent
+  reporting; and
 - GraphRAG kind/property filtering, bounded traversal, complete payload
-  budgets, provenance, vector intersection, and public/private merge
-  validation.
+  budgets, provenance, vector intersection, session-bound candidate indexes,
+  exact targeted ciphertext reads, fail-closed context mismatch, and
+  public/private merge validation.
 
 Production also needs:
 
@@ -504,6 +617,11 @@ Production also needs:
 - live Neo4j two-vault, constraint, transient-retry, and malformed/orphan data
   integration tests; and
 - independent security and privacy assessment.
+
+Production responsibilities and the explicit review gate are in
+[PRODUCTION_SETUP.md](PRODUCTION_SETUP.md),
+[OPERATIONS.md](OPERATIONS.md), and
+[SECURITY_REVIEW.md](SECURITY_REVIEW.md). No independent signoff has occurred.
 
 ## Primary references
 

@@ -11,9 +11,9 @@ from authgraph.models import (
     KdfParameters,
     KeyEnvelope,
     ProtectionScopeRow,
-    ScopeKeyEnvelope,
     ScopedEncryptedEntityRow,
     ScopedEncryptedRelationshipRow,
+    ScopeKeyEnvelope,
     VaultRow,
 )
 

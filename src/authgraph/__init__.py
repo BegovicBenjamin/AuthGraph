@@ -1,10 +1,32 @@
 """AuthGraph public API."""
 
+from .audit import (
+    AuditSink,
+    AuditUnavailable,
+    CommittedSecurityAuditEvent,
+    InMemoryAuditSink,
+    JsonLinesAuditSink,
+    PreparedSecurityAuditOperation,
+    SecurityAuditLogger,
+    SecurityAuditRecord,
+    SecurityAuditVerificationReport,
+    SecurityEventOutcome,
+    SecurityEventType,
+    verify_json_lines_audit,
+    verify_json_lines_audit_report,
+)
 from .authgraph import AuthGraph, GraphEntityRecord, GraphRelationshipRecord
+from .aws_kms import AwsKmsKeyWrappingBackend
 from .crypto import CryptoEngine
+from .durable_grants import DurableScopeGrantPolicy
+from .durable_otp import (
+    DurableOneTimeCodeBroker,
+    DurableOneTimeCodeEvidence,
+)
+from .durable_sessions import DurableScopedSessionBroker
 from .errors import (
-    AuthorizationDenied,
     AuthGraphError,
+    AuthorizationDenied,
     ConflictError,
     IntegrityViolation,
     RecordNotFound,
@@ -12,8 +34,34 @@ from .errors import (
     UnlockDenied,
     ValidationError,
 )
-from .memory_repository import InMemoryGraphRepository
+from .key_custody import (
+    EnvelopeScopeKeyProvider,
+    InMemoryAesKeyWrappingBackend,
+    InMemoryKeySlotStore,
+    KeyCustodyConflict,
+    KeyCustodyError,
+    KeyCustodyUnavailable,
+    KeySlotIdentity,
+    KeySlotRow,
+    KeySlotState,
+    KeySlotStore,
+    KeyWrappingBackend,
+    RecoveredKeyMaterial,
+    RecoveryKeyProvenance,
+    RecoveryKeyWrappingBackend,
+    RecoveryRewrapResult,
+    WrappedKeyBlob,
+)
+from .layered_service import LayeredGraphService
+from .lifecycle import (
+    VaultGuard,
+    VaultLifecyclePhase,
+    VaultLifecycleState,
+    VaultManagementTransition,
+    VaultRevisionTransition,
+)
 from .memory_public_repository import InMemoryPublicGraphRepository
+from .memory_repository import InMemoryGraphRepository
 from .models import (
     AccessContext,
     Entity,
@@ -33,21 +81,21 @@ from .models import (
     ScopedVaultSnapshot,
     VaultSnapshot,
 )
-from .layered_service import LayeredGraphService
-from .service import AuthGraphService
-from .sessions import InMemorySessionBroker
-from .neo4j_repository import Neo4jGraphRepository
 from .neo4j_public_repository import Neo4jPublicGraphRepository
-from .neo4j_scoped_repository import Neo4jScopedGraphRepository
+from .neo4j_repository import Neo4jGraphRepository
 from .neo4j_schema import (
+    CURRENT_SCHEMA_VERSION,
     Neo4jSchemaError,
     SchemaApplyError,
+    SchemaMigrationError,
     SchemaProblem,
     SchemaVerificationError,
     SchemaVerificationReport,
+    apply_migrations,
     apply_schema,
     verify_schema,
 )
+from .neo4j_scoped_repository import Neo4jScopedGraphRepository
 from .otp import (
     InMemoryOneTimeCodeBroker,
     IssuedOneTimeCode,
@@ -57,29 +105,38 @@ from .otp import (
     OneTimeCodeEvidenceConsumer,
     OneTimeCodeUnavailable,
 )
+from .recovery import MirroredKeyWrappingBackend
 from .retrieval import (
     DisclosurePolicy,
     EphemeralVectorIndex,
     LayeredGraphViewProvider,
-    RetrievedEntity,
-    RetrievedRelationship,
-    RetrievedSubgraph,
     RetrievalLimit,
     RetrievalProvenance,
     RetrievalSource,
+    RetrievedEntity,
+    RetrievedRelationship,
+    RetrievedSubgraph,
     SessionBoundRetrievalTool,
+    SessionCandidateIndex,
     SessionVisibleGraphGateway,
+    TargetedLayeredGraphViewProvider,
     VectorMatch,
 )
 from .scoped_retrieval import ScopedGraphViewAdapter
 from .scoped_service import ScopedAuthGraphService
 from .scoped_sessions import (
-    ScopeKeyMaterial,
     ScopedSessionBroker,
+    ScopedSessionBrokerProtocol,
+    ScopeKeyMaterial,
 )
+from .security_operations import SecurityOperations, VaultSessionRevoker
+from .service import AuthGraphService
+from .sessions import InMemorySessionBroker, SessionBroker
+from .sqlite_key_slots import SqliteKeySlotStore
 from .unlock_policy import (
     InMemoryScopeKeyProvider,
     ReleasedScopeKeys,
+    ScopeGrantConsumer,
     ScopeGrantDenied,
     ScopeGrantPolicy,
     ScopeKeyEnrollmentProvider,
@@ -88,17 +145,29 @@ from .unlock_policy import (
     UnlockProfile,
 )
 
+__version__ = "0.3.0"
+
 LegacyAuthGraphService = AuthGraphService
 
 __all__ = [
     "AccessContext",
+    "AuditSink",
+    "AuditUnavailable",
     "AuthGraph",
     "AuthorizationDenied",
     "AuthGraphError",
     "AuthGraphService",
+    "AwsKmsKeyWrappingBackend",
     "ConflictError",
+    "CommittedSecurityAuditEvent",
     "CryptoEngine",
+    "CURRENT_SCHEMA_VERSION",
     "DisclosurePolicy",
+    "DurableOneTimeCodeBroker",
+    "DurableOneTimeCodeEvidence",
+    "DurableScopeGrantPolicy",
+    "DurableScopedSessionBroker",
+    "EnvelopeScopeKeyProvider",
     "Entity",
     "EphemeralVectorIndex",
     "GraphEntityRef",
@@ -107,13 +176,25 @@ __all__ = [
     "GraphRelationshipRef",
     "GraphRelationshipRecord",
     "InMemoryGraphRepository",
+    "InMemoryAesKeyWrappingBackend",
+    "InMemoryAuditSink",
+    "InMemoryKeySlotStore",
     "InMemoryOneTimeCodeBroker",
     "InMemoryPublicGraphRepository",
     "InMemoryScopeKeyProvider",
     "InMemorySessionBroker",
     "IntegrityViolation",
     "IssuedOneTimeCode",
+    "JsonLinesAuditSink",
     "KdfParameters",
+    "KeyCustodyConflict",
+    "KeyCustodyError",
+    "KeyCustodyUnavailable",
+    "KeySlotIdentity",
+    "KeySlotRow",
+    "KeySlotState",
+    "KeySlotStore",
+    "KeyWrappingBackend",
     "LayeredEntity",
     "LayeredGraphService",
     "LayeredGraphView",
@@ -121,6 +202,7 @@ __all__ = [
     "LayeredRelationship",
     "LegacyAuthGraphService",
     "LockedDisclosure",
+    "MirroredKeyWrappingBackend",
     "Neighborhood",
     "Neo4jGraphRepository",
     "Neo4jPublicGraphRepository",
@@ -132,7 +214,12 @@ __all__ = [
     "OneTimeCodeEvidenceConsumer",
     "OneTimeCodeUnavailable",
     "ProtectionLevel",
+    "PreparedSecurityAuditOperation",
     "RecordNotFound",
+    "RecoveredKeyMaterial",
+    "RecoveryKeyProvenance",
+    "RecoveryKeyWrappingBackend",
+    "RecoveryRewrapResult",
     "Relationship",
     "ReleasedScopeKeys",
     "RetrievedEntity",
@@ -141,13 +228,16 @@ __all__ = [
     "RetrievalLimit",
     "RetrievalProvenance",
     "RetrievalSource",
+    "SessionCandidateIndex",
     "ScopeGrantDenied",
+    "ScopeGrantConsumer",
     "ScopeGrantPolicy",
     "ScopeKeyEnrollmentProvider",
     "ScopeKeyMaterial",
     "ScopeKeyReleaseProvider",
     "ScopeUnlockGrant",
     "SchemaApplyError",
+    "SchemaMigrationError",
     "SchemaProblem",
     "SchemaVerificationError",
     "SchemaVerificationReport",
@@ -156,15 +246,36 @@ __all__ = [
     "ScopedGraphViewAdapter",
     "ScopedRelationship",
     "ScopedSessionBroker",
+    "ScopedSessionBrokerProtocol",
     "ScopedVaultSnapshot",
+    "SecurityAuditLogger",
+    "SecurityAuditRecord",
+    "SecurityAuditVerificationReport",
+    "SecurityEventOutcome",
+    "SecurityEventType",
+    "SecurityOperations",
     "SessionBoundRetrievalTool",
+    "SessionBroker",
     "SessionVisibleGraphGateway",
     "SessionUnavailable",
+    "SqliteKeySlotStore",
     "UnlockDenied",
     "ValidationError",
     "VectorMatch",
     "VaultSnapshot",
+    "VaultGuard",
+    "VaultLifecyclePhase",
+    "VaultLifecycleState",
+    "VaultManagementTransition",
+    "VaultRevisionTransition",
+    "VaultSessionRevoker",
+    "WrappedKeyBlob",
     "UnlockProfile",
+    "__version__",
+    "apply_migrations",
     "apply_schema",
+    "verify_json_lines_audit",
+    "verify_json_lines_audit_report",
     "verify_schema",
+    "TargetedLayeredGraphViewProvider",
 ]

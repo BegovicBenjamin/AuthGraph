@@ -376,6 +376,142 @@ class ScopedCrudTests(unittest.TestCase):
             )
         self.assertEqual(self.repository.scoped_counts(), before)
 
+    def test_relationship_bundle_idempotency_compares_decrypted_intent(
+        self,
+    ) -> None:
+        context = self.unlock(self.scope_a, self.scope_b)
+        existing = self.service.create_entity(
+            context,
+            self.scope_b,
+            "Existing",
+            {},
+        )
+        first = self.service.create_relationship_bundle(
+            context,
+            self.scope_a,
+            (("Helper", {"value": 7}),),
+            existing,
+            0,
+            "POINTS_TO",
+            {"source": "import"},
+            idempotency_key="bundle-import-1001",
+        )
+        replay = self.service.create_relationship_bundle(
+            context,
+            self.scope_a,
+            (("Helper", {"value": 7}),),
+            existing,
+            0,
+            "POINTS_TO",
+            {"source": "import"},
+            idempotency_key="bundle-import-1001",
+        )
+        self.assertEqual(replay, first)
+        self.assertIn("scoped_relationship_", first[0])
+        self.assertIn("scoped_entity_", first[1][0])
+        self.assertEqual(self.repository.scoped_counts(), (2, 1))
+
+        with self.assertRaises(ConflictError):
+            self.service.create_relationship_bundle(
+                context,
+                self.scope_a,
+                (("Helper", {"value": 8}),),
+                existing,
+                0,
+                "POINTS_TO",
+                {"source": "import"},
+                idempotency_key="bundle-import-1001",
+            )
+        self.assertEqual(self.repository.scoped_counts(), (2, 1))
+
+    def test_relationship_bundle_delete_is_atomic_and_restrictive(
+        self,
+    ) -> None:
+        context = self.unlock(self.scope_a, self.scope_b)
+        existing = self.service.create_entity(
+            context,
+            self.scope_b,
+            "Existing",
+            {},
+        )
+        relationship_id, helper_ids = (
+            self.service.create_relationship_bundle(
+                context,
+                self.scope_a,
+                (("Helper", {}),),
+                existing,
+                0,
+                "POINTS_TO",
+            )
+        )
+        with self.assertRaises(ConflictError):
+            self.service.delete_relationship_bundle(
+                context,
+                relationship_id,
+                helper_ids,
+                expected_revision=2,
+            )
+        self.assertEqual(self.repository.scoped_counts(), (2, 1))
+
+        self.service.delete_relationship_bundle(
+            context,
+            relationship_id,
+            helper_ids,
+            expected_revision=1,
+        )
+        self.assertEqual(self.repository.scoped_counts(), (1, 0))
+        self.assertEqual(
+            self.service.get_entity(context, existing).entity_id,
+            existing,
+        )
+
+    def test_relationship_bundle_delete_rejects_shared_helper(
+        self,
+    ) -> None:
+        context = self.unlock(self.scope_a, self.scope_b)
+        existing = self.service.create_entity(
+            context,
+            self.scope_b,
+            "Existing",
+            {},
+        )
+        relationship_id, helper_ids = (
+            self.service.create_relationship_bundle(
+                context,
+                self.scope_a,
+                (("Helper", {}),),
+                existing,
+                0,
+                "POINTS_TO",
+            )
+        )
+        other = self.service.create_entity(
+            context,
+            self.scope_a,
+            "Other",
+            {},
+        )
+        self.service.connect(
+            context,
+            self.scope_a,
+            helper_ids[0],
+            other,
+            "SHARES_HELPER",
+        )
+        before = self.repository.scoped_counts()
+        with self.assertRaises(ConflictError):
+            self.service.delete_relationship_bundle(
+                context,
+                relationship_id,
+                helper_ids,
+                expected_revision=1,
+            )
+        self.assertEqual(self.repository.scoped_counts(), before)
+        self.assertEqual(
+            self.service.get_relationship(context, relationship_id).kind,
+            "POINTS_TO",
+        )
+
     def test_repository_bundle_accepts_only_new_record_revision_one(
         self,
     ) -> None:

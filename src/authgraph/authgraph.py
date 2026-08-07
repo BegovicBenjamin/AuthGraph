@@ -13,6 +13,8 @@ private Neo4j rows.
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import secrets
 import unicodedata
@@ -53,9 +55,9 @@ from .service import (
     MAX_VAULT_SNAPSHOT_RELATIONSHIPS,
 )
 
-
 MAX_PUBLIC_JSON_BYTES = 64 * 1024
 MAX_PUBLIC_SNAPSHOT_JSON_BYTES = 256 * 1024
+MAX_IDEMPOTENCY_KEY_CHARS = 256
 
 PRIVATE_ENTITY_WRAPPER_KIND = "__authgraph_facade_private_entity_v2"
 PUBLIC_ANCHOR_WRAPPER_KIND = "__authgraph_facade_public_anchor_v2"
@@ -79,24 +81,19 @@ _RESERVED_KINDS = frozenset(
 
 @dataclass(frozen=True, slots=True)
 class GraphEntityRecord:
-    """One resolved semantic entity without its private protection-scope ID.
-
-    Public records currently have no mutation revision, so
-    ``record_revision`` is ``None`` for them. Private scoped-v2 records always
-    carry a positive revision suitable for optimistic updates and deletes.
-    """
+    """One resolved semantic entity with optimistic revision metadata."""
 
     graph_id: str
     entity_id: str
     kind: str
     properties: Mapping[str, Any]
     protection: ProtectionLevel
-    record_revision: int | None
+    record_revision: int
 
 
 @dataclass(frozen=True, slots=True)
 class GraphRelationshipRecord:
-    """One resolved private relationship with optimistic revision metadata."""
+    """One resolved relationship with optimistic revision metadata."""
 
     graph_id: str
     relationship_id: str
@@ -129,6 +126,54 @@ def _validate_kind(kind: str) -> None:
         raise ValidationError(
             "Entity and relationship kinds must be short text."
         )
+
+
+def _validate_record_revision(record_revision: int) -> None:
+    if type(record_revision) is not int or record_revision <= 0:
+        raise ValidationError("Record revision must be a positive integer.")
+
+
+def _validate_idempotency_key(idempotency_key: str) -> None:
+    if (
+        not isinstance(idempotency_key, str)
+        or not idempotency_key
+        or len(idempotency_key) > MAX_IDEMPOTENCY_KEY_CHARS
+        or any(
+            unicodedata.category(char).startswith("C")
+            for char in idempotency_key
+        )
+    ):
+        raise ValidationError("Invalid opaque idempotency key.")
+
+
+def _public_idempotent_object_id(
+    *,
+    operation: str,
+    graph_id: str,
+    idempotency_key: str,
+) -> str:
+    """Derive a stable public ID without persisting the request key."""
+
+    _validate_idempotency_key(idempotency_key)
+    message = json.dumps(
+        [
+            "authgraph",
+            "public-idempotency",
+            1,
+            operation,
+            graph_id,
+            idempotency_key,
+        ],
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    digest = hashlib.sha256(message).digest()
+    encoded = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+    object_type = (
+        "entity" if operation == "create-entity" else "relationship"
+    )
+    return f"public_{object_type}_{encoded}"
 
 
 def _copy_json_properties(properties: Mapping[str, Any]) -> dict[str, Any]:
@@ -184,7 +229,12 @@ class AuthGraph:
         required_repository_methods = (
             "put_public_entity",
             "get_public_entity",
+            "replace_public_entity",
+            "delete_public_entity",
             "put_public_relationship",
+            "get_public_relationship",
+            "replace_public_relationship",
+            "delete_public_relationship",
             "get_public_graph_snapshot",
         )
         if any(
@@ -392,24 +442,47 @@ class AuthGraph:
                 "A public entity must not select a protection scope."
             )
         if idempotency_key is not None:
-            raise ValidationError(
-                "Public idempotent creation is not implemented."
-            )
+            _validate_idempotency_key(idempotency_key)
         self._authorize_public_write(publisher, graph_id)
-        for _ in range(3):
-            entity_id = f"public_{secrets.token_urlsafe(24)}"
-            if self._public_repository.put_public_entity(
-                PublicEntityRow(
+        attempts = 1 if idempotency_key is not None else 3
+        for _ in range(attempts):
+            entity_id = (
+                _public_idempotent_object_id(
+                    operation="create-entity",
                     graph_id=graph_id,
-                    entity_id=entity_id,
-                    kind=kind,
-                    properties=copied,
+                    idempotency_key=idempotency_key,
                 )
-            ):
+                if idempotency_key is not None
+                else f"public_{secrets.token_urlsafe(24)}"
+            )
+            candidate = PublicEntityRow(
+                graph_id=graph_id,
+                entity_id=entity_id,
+                kind=kind,
+                properties=copied,
+            )
+            if self._public_repository.put_public_entity(candidate):
                 return GraphEntityRef(
                     graph_id=graph_id,
                     entity_id=entity_id,
                     protection=ProtectionLevel.PUBLIC,
+                )
+            if idempotency_key is not None:
+                existing = self._public_repository.get_public_entity(
+                    graph_id,
+                    entity_id,
+                )
+                if existing is not None:
+                    self._decode_public_entity(graph_id, existing)
+                if existing == candidate:
+                    return GraphEntityRef(
+                        graph_id=graph_id,
+                        entity_id=entity_id,
+                        protection=ProtectionLevel.PUBLIC,
+                    )
+                raise ConflictError(
+                    "The idempotency key was already used for a different "
+                    "public entity create."
                 )
         raise ConflictError("Could not allocate a unique public entity identifier.")
 
@@ -431,37 +504,37 @@ class AuthGraph:
             )
             if row is None:
                 raise RecordNotFound()
-            entity = self._decode_public_entity(graph_id, row)
+            public_entity = self._decode_public_entity(graph_id, row)
             return GraphEntityRecord(
                 graph_id=graph_id,
-                entity_id=entity.entity_id,
-                kind=entity.kind,
-                properties=entity.properties,
+                entity_id=public_entity.entity_id,
+                kind=public_entity.kind,
+                properties=public_entity.properties,
                 protection=ProtectionLevel.PUBLIC,
-                record_revision=None,
+                record_revision=row.record_revision,
             )
 
-        entity = self._protected.get_entity(
+        private_entity = self._protected.get_entity(
             self._require_context(context),
             reference.entity_id,
         )
         if (
-            not isinstance(entity, ScopedEntity)
-            or entity.kind != PRIVATE_ENTITY_WRAPPER_KIND
+            not isinstance(private_entity, ScopedEntity)
+            or private_entity.kind != PRIVATE_ENTITY_WRAPPER_KIND
         ):
             raise RecordNotFound()
         entity_graph_id, semantic_kind, semantic_properties = (
-            self._decode_private_entity(entity)
+            self._decode_private_entity(private_entity)
         )
         if entity_graph_id != graph_id:
             raise RecordNotFound()
         return GraphEntityRecord(
             graph_id=graph_id,
-            entity_id=entity.entity_id,
+            entity_id=private_entity.entity_id,
             kind=semantic_kind,
             properties=semantic_properties,
             protection=ProtectionLevel.PRIVATE,
-            record_revision=entity.record_revision,
+            record_revision=private_entity.record_revision,
         )
 
     def update_entity(
@@ -471,19 +544,51 @@ class AuthGraph:
         kind: str,
         properties: Mapping[str, Any],
         *,
-        context: AccessContext,
+        context: AccessContext | None = None,
         expected_revision: int,
+        publisher: object | None = None,
     ) -> GraphEntityRecord:
-        """Update one private entity without changing its graph or scope."""
+        """Update one entity without changing its graph or protection."""
 
         _validate_id(graph_id, "Invalid opaque graph identifier.")
         self._validate_ref(graph_id, reference)
-        if reference.protection is not ProtectionLevel.PRIVATE:
-            raise ValidationError(
-                "Public entity updates are not implemented."
-            )
         _validate_kind(kind)
+        _validate_record_revision(expected_revision)
         copied = _copy_json_properties(properties)
+        if reference.protection is ProtectionLevel.PUBLIC:
+            self._authorize_public_write(publisher, graph_id)
+            current = self._public_repository.get_public_entity(
+                graph_id,
+                reference.entity_id,
+            )
+            if current is None:
+                raise RecordNotFound()
+            self._decode_public_entity(graph_id, current)
+            if current.record_revision != expected_revision:
+                raise ConflictError("The public entity revision is stale.")
+            candidate = PublicEntityRow(
+                graph_id=graph_id,
+                entity_id=reference.entity_id,
+                kind=kind,
+                properties=copied,
+                record_revision=expected_revision + 1,
+            )
+            if not self._public_repository.replace_public_entity(
+                graph_id,
+                reference.entity_id,
+                expected_revision,
+                candidate,
+            ):
+                raise ConflictError("The public entity update conflicted.")
+            return GraphEntityRecord(
+                graph_id=graph_id,
+                entity_id=reference.entity_id,
+                kind=kind,
+                properties=copied,
+                protection=ProtectionLevel.PUBLIC,
+                record_revision=candidate.record_revision,
+            )
+
         secure_context = self._require_context(context)
         # Do not let this facade reclassify a raw low-level scoped record into
         # one of its wrappers. Resolve the existing wrapper first.
@@ -518,17 +623,37 @@ class AuthGraph:
         graph_id: str,
         reference: GraphEntityRef,
         *,
-        context: AccessContext,
+        context: AccessContext | None = None,
         expected_revision: int,
+        publisher: object | None = None,
     ) -> None:
-        """Delete one private entity if it has no incident relationships."""
+        """Delete an entity if it has no same-layer relationships."""
 
         _validate_id(graph_id, "Invalid opaque graph identifier.")
         self._validate_ref(graph_id, reference)
-        if reference.protection is not ProtectionLevel.PRIVATE:
-            raise ValidationError(
-                "Public entity deletion is not implemented."
+        _validate_record_revision(expected_revision)
+        if reference.protection is ProtectionLevel.PUBLIC:
+            self._authorize_public_write(publisher, graph_id)
+            current = self._public_repository.get_public_entity(
+                graph_id,
+                reference.entity_id,
             )
+            if current is None:
+                raise RecordNotFound()
+            self._decode_public_entity(graph_id, current)
+            if current.record_revision != expected_revision:
+                raise ConflictError("The public entity revision is stale.")
+            if not self._public_repository.delete_public_entity(
+                graph_id,
+                reference.entity_id,
+                expected_revision,
+            ):
+                raise ConflictError(
+                    "The public entity delete conflicted or it still has "
+                    "public relationships."
+                )
+            return
+
         secure_context = self._require_context(context)
         self.get_entity(graph_id, reference, context=secure_context)
         self._protected.delete_entity(
@@ -580,30 +705,55 @@ class AuthGraph:
                     "A public relationship must not select a protection scope."
                 )
             if idempotency_key is not None:
-                raise ValidationError(
-                    "Public idempotent creation is not implemented."
-                )
+                _validate_idempotency_key(idempotency_key)
             # Resolve both references before writing.  Their claimed
             # ProtectionLevel is not treated as proof of storage.
             self.get_entity(graph_id, from_entity)
             self.get_entity(graph_id, to_entity)
             self._authorize_public_write(publisher, graph_id)
-            for _ in range(3):
-                relationship_id = f"public_{secrets.token_urlsafe(24)}"
-                if self._public_repository.put_public_relationship(
-                    PublicRelationshipRow(
+            attempts = 1 if idempotency_key is not None else 3
+            for _ in range(attempts):
+                relationship_id = (
+                    _public_idempotent_object_id(
+                        operation="create-relationship",
                         graph_id=graph_id,
-                        relationship_id=relationship_id,
-                        from_entity_id=from_entity.entity_id,
-                        to_entity_id=to_entity.entity_id,
-                        kind=kind,
-                        properties=copied,
+                        idempotency_key=idempotency_key,
                     )
-                ):
+                    if idempotency_key is not None
+                    else f"public_{secrets.token_urlsafe(24)}"
+                )
+                candidate = PublicRelationshipRow(
+                    graph_id=graph_id,
+                    relationship_id=relationship_id,
+                    from_entity_id=from_entity.entity_id,
+                    to_entity_id=to_entity.entity_id,
+                    kind=kind,
+                    properties=copied,
+                )
+                if self._public_repository.put_public_relationship(candidate):
                     return GraphRelationshipRef(
                         graph_id=graph_id,
                         relationship_id=relationship_id,
                         protection=ProtectionLevel.PUBLIC,
+                    )
+                if idempotency_key is not None:
+                    existing = (
+                        self._public_repository.get_public_relationship(
+                            graph_id,
+                            relationship_id,
+                        )
+                    )
+                    if existing is not None:
+                        self._decode_public_relationship(graph_id, existing)
+                    if existing == candidate:
+                        return GraphRelationshipRef(
+                            graph_id=graph_id,
+                            relationship_id=relationship_id,
+                            protection=ProtectionLevel.PUBLIC,
+                        )
+                    raise ConflictError(
+                        "The idempotency key was already used for a "
+                        "different public relationship create."
                     )
             raise ConflictError(
                 "Could not allocate a unique public relationship identifier."
@@ -658,11 +808,6 @@ class AuthGraph:
             "properties": copied,
         }
         if new_anchor_specs:
-            if idempotency_key is not None:
-                raise ValidationError(
-                    "Idempotent creation of encrypted public-anchor "
-                    "relationships is not implemented."
-                )
             relationship_id, _ = (
                 self._protected.create_relationship_bundle(
                     secure_context,
@@ -672,6 +817,7 @@ class AuthGraph:
                     to_protected,
                     PRIVATE_RELATIONSHIP_WRAPPER_KIND,
                     relationship_properties,
+                    idempotency_key=idempotency_key,
                 )
             )
         else:
@@ -700,52 +846,70 @@ class AuthGraph:
         graph_id: str,
         reference: GraphRelationshipRef,
         *,
-        context: AccessContext,
+        context: AccessContext | None = None,
     ) -> GraphRelationshipRecord:
-        """Resolve one private relationship without revealing its scope ID."""
+        """Resolve one relationship without revealing a private scope ID."""
 
         _validate_id(graph_id, "Invalid opaque graph identifier.")
         self._validate_relationship_ref(graph_id, reference)
-        if reference.protection is not ProtectionLevel.PRIVATE:
-            raise ValidationError(
-                "Public relationship lookup is not implemented."
+        if reference.protection is ProtectionLevel.PUBLIC:
+            row = self._public_repository.get_public_relationship(
+                graph_id,
+                reference.relationship_id,
             )
-        relationship = self._protected.get_relationship(
+            if row is None:
+                raise RecordNotFound()
+            public_relationship = self._decode_public_relationship(
+                graph_id,
+                row,
+            )
+            return GraphRelationshipRecord(
+                graph_id=graph_id,
+                relationship_id=public_relationship.relationship_id,
+                from_entity_id=public_relationship.from_entity_id,
+                to_entity_id=public_relationship.to_entity_id,
+                kind=public_relationship.kind,
+                properties=public_relationship.properties,
+                protection=ProtectionLevel.PUBLIC,
+                record_revision=row.record_revision,
+            )
+
+        private_relationship = self._protected.get_relationship(
             self._require_context(context),
             reference.relationship_id,
         )
         if (
-            not isinstance(relationship, ScopedRelationship)
-            or relationship.kind != PRIVATE_RELATIONSHIP_WRAPPER_KIND
+            not isinstance(private_relationship, ScopedRelationship)
+            or private_relationship.kind != PRIVATE_RELATIONSHIP_WRAPPER_KIND
         ):
             raise RecordNotFound()
         (
             relationship_graph_id,
             semantic_kind,
             semantic_properties,
-        ) = self._decode_private_relationship(relationship)
+        ) = self._decode_private_relationship(private_relationship)
         if relationship_graph_id != graph_id:
             raise RecordNotFound()
         secure_context = self._require_context(context)
         from_entity_id = self._resolve_private_endpoint(
             graph_id,
             secure_context,
-            relationship.from_entity_id,
+            private_relationship.from_entity_id,
         )
         to_entity_id = self._resolve_private_endpoint(
             graph_id,
             secure_context,
-            relationship.to_entity_id,
+            private_relationship.to_entity_id,
         )
         return GraphRelationshipRecord(
             graph_id=graph_id,
-            relationship_id=relationship.relationship_id,
+            relationship_id=private_relationship.relationship_id,
             from_entity_id=from_entity_id,
             to_entity_id=to_entity_id,
             kind=semantic_kind,
             properties=semantic_properties,
             protection=ProtectionLevel.PRIVATE,
-            record_revision=relationship.record_revision,
+            record_revision=private_relationship.record_revision,
         )
 
     def _resolve_private_endpoint(
@@ -788,21 +952,61 @@ class AuthGraph:
         kind: str,
         properties: Mapping[str, Any] | None = None,
         *,
-        context: AccessContext,
+        context: AccessContext | None = None,
         expected_revision: int,
+        publisher: object | None = None,
     ) -> GraphRelationshipRecord:
-        """Update private relationship semantics without moving endpoints."""
+        """Update relationship semantics without moving endpoints."""
 
         _validate_id(graph_id, "Invalid opaque graph identifier.")
         self._validate_relationship_ref(graph_id, reference)
-        if reference.protection is not ProtectionLevel.PRIVATE:
-            raise ValidationError(
-                "Public relationship updates are not implemented."
-            )
         _validate_kind(kind)
+        _validate_record_revision(expected_revision)
         copied = _copy_json_properties(
             {} if properties is None else properties
         )
+        if reference.protection is ProtectionLevel.PUBLIC:
+            self._authorize_public_write(publisher, graph_id)
+            current = self._public_repository.get_public_relationship(
+                graph_id,
+                reference.relationship_id,
+            )
+            if current is None:
+                raise RecordNotFound()
+            decoded = self._decode_public_relationship(graph_id, current)
+            if current.record_revision != expected_revision:
+                raise ConflictError(
+                    "The public relationship revision is stale."
+                )
+            candidate = PublicRelationshipRow(
+                graph_id=graph_id,
+                relationship_id=reference.relationship_id,
+                from_entity_id=current.from_entity_id,
+                to_entity_id=current.to_entity_id,
+                kind=kind,
+                properties=copied,
+                record_revision=expected_revision + 1,
+            )
+            if not self._public_repository.replace_public_relationship(
+                graph_id,
+                reference.relationship_id,
+                expected_revision,
+                candidate,
+            ):
+                raise ConflictError(
+                    "The public relationship update conflicted."
+                )
+            return GraphRelationshipRecord(
+                graph_id=graph_id,
+                relationship_id=reference.relationship_id,
+                from_entity_id=decoded.from_entity_id,
+                to_entity_id=decoded.to_entity_id,
+                kind=kind,
+                properties=copied,
+                protection=ProtectionLevel.PUBLIC,
+                record_revision=candidate.record_revision,
+            )
+
         secure_context = self._require_context(context)
         self.get_relationship(
             graph_id,
@@ -853,28 +1057,93 @@ class AuthGraph:
         graph_id: str,
         reference: GraphRelationshipRef,
         *,
-        context: AccessContext,
+        context: AccessContext | None = None,
         expected_revision: int,
+        publisher: object | None = None,
     ) -> None:
-        """Delete one private relationship with an optimistic revision."""
+        """Delete one relationship with an optimistic revision."""
 
         _validate_id(graph_id, "Invalid opaque graph identifier.")
         self._validate_relationship_ref(graph_id, reference)
-        if reference.protection is not ProtectionLevel.PRIVATE:
-            raise ValidationError(
-                "Public relationship deletion is not implemented."
+        _validate_record_revision(expected_revision)
+        if reference.protection is ProtectionLevel.PUBLIC:
+            self._authorize_public_write(publisher, graph_id)
+            current = self._public_repository.get_public_relationship(
+                graph_id,
+                reference.relationship_id,
             )
+            if current is None:
+                raise RecordNotFound()
+            self._decode_public_relationship(graph_id, current)
+            if current.record_revision != expected_revision:
+                raise ConflictError(
+                    "The public relationship revision is stale."
+                )
+            if not self._public_repository.delete_public_relationship(
+                graph_id,
+                reference.relationship_id,
+                expected_revision,
+            ):
+                raise ConflictError(
+                    "The public relationship delete conflicted."
+                )
+            return
+
         secure_context = self._require_context(context)
-        self.get_relationship(
-            graph_id,
-            reference,
-            context=secure_context,
-        )
-        self._protected.delete_relationship(
+        relationship = self._protected.get_relationship(
             secure_context,
             reference.relationship_id,
-            expected_revision=expected_revision,
         )
+        if (
+            not isinstance(relationship, ScopedRelationship)
+            or relationship.kind != PRIVATE_RELATIONSHIP_WRAPPER_KIND
+        ):
+            raise RecordNotFound()
+        relationship_graph_id, _, _ = self._decode_private_relationship(
+            relationship
+        )
+        if relationship_graph_id != graph_id:
+            raise RecordNotFound()
+
+        helper_entity_ids: list[str] = []
+        endpoint_ids = dict.fromkeys(
+            (
+                relationship.from_entity_id,
+                relationship.to_entity_id,
+            )
+        )
+        for endpoint_id in endpoint_ids:
+            endpoint = self._protected.get_entity(
+                secure_context,
+                endpoint_id,
+            )
+            if not isinstance(endpoint, ScopedEntity):
+                raise IntegrityViolation()
+            if endpoint.kind == PRIVATE_ENTITY_WRAPPER_KIND:
+                endpoint_graph_id, _, _ = self._decode_private_entity(
+                    endpoint
+                )
+            elif endpoint.kind == PUBLIC_ANCHOR_WRAPPER_KIND:
+                endpoint_graph_id, _ = self._decode_public_anchor(endpoint)
+                helper_entity_ids.append(endpoint.entity_id)
+            else:
+                raise RecordNotFound()
+            if endpoint_graph_id != graph_id:
+                raise RecordNotFound()
+
+        if helper_entity_ids:
+            self._protected.delete_relationship_bundle(
+                secure_context,
+                reference.relationship_id,
+                tuple(helper_entity_ids),
+                expected_revision=expected_revision,
+            )
+        else:
+            self._protected.delete_relationship(
+                secure_context,
+                reference.relationship_id,
+                expected_revision=expected_revision,
+            )
 
     @staticmethod
     def _validate_ref(
@@ -952,6 +1221,7 @@ class AuthGraph:
 
         private_entity_ids: set[str] = set()
         public_anchors: dict[str, str] = {}
+        unresolved_public_anchors: set[str] = set()
         for entity in snapshot.entities:
             if not isinstance(entity, ScopedEntity):
                 raise IntegrityViolation()
@@ -963,9 +1233,12 @@ class AuthGraph:
                     continue
                 if (
                     entity.entity_id in public_anchors
-                    or public_entity_id not in entities
+                    or entity.entity_id in unresolved_public_anchors
                 ):
                     raise IntegrityViolation()
+                if public_entity_id not in entities:
+                    unresolved_public_anchors.add(entity.entity_id)
+                    continue
                 public_anchors[entity.entity_id] = public_entity_id
                 continue
             if entity.kind != PRIVATE_ENTITY_WRAPPER_KIND:
@@ -1004,12 +1277,21 @@ class AuthGraph:
                 relationship.relationship_id in relationships
             ):
                 raise IntegrityViolation()
-            endpoint_ids = private_entity_ids | set(public_anchors)
+            endpoint_ids = (
+                private_entity_ids
+                | set(public_anchors)
+                | unresolved_public_anchors
+            )
             if (
                 relationship.from_entity_id not in endpoint_ids
                 or relationship.to_entity_id not in endpoint_ids
             ):
                 raise IntegrityViolation()
+            if (
+                relationship.from_entity_id in unresolved_public_anchors
+                or relationship.to_entity_id in unresolved_public_anchors
+            ):
+                continue
             from_entity_id = public_anchors.get(
                 relationship.from_entity_id,
                 relationship.from_entity_id,
@@ -1023,6 +1305,212 @@ class AuthGraph:
             relationships[relationship.relationship_id] = (
                 LayeredRelationship(
                     relationship_id=relationship.relationship_id,
+                    from_entity_id=from_entity_id,
+                    to_entity_id=to_entity_id,
+                    kind=semantic_kind,
+                    properties=semantic_properties,
+                    protection=ProtectionLevel.PRIVATE,
+                )
+            )
+
+        return LayeredGraphView(
+            graph_id=graph_id,
+            entities=tuple(
+                sorted(entities.values(), key=lambda row: row.entity_id)
+            ),
+            relationships=tuple(
+                sorted(
+                    relationships.values(),
+                    key=lambda row: row.relationship_id,
+                )
+            ),
+            private_overlay_included=True,
+            locked_disclosure=LockedDisclosure.HIDDEN,
+        )
+
+    def get_targeted_unlocked_view(
+        self,
+        graph_id: str,
+        context: AccessContext,
+        *,
+        entity_ids: tuple[str, ...],
+        relationship_ids: tuple[str, ...],
+    ) -> LayeredGraphView:
+        """Resolve one exact current slice selected by a session index."""
+
+        _validate_id(graph_id, "Invalid opaque graph identifier.")
+        snapshot = self._protected.get_targeted_snapshot(
+            self._require_context(context),
+            entity_ids,
+            relationship_ids,
+        )
+        # Validate the secure capability before reading or merging plaintext.
+        requested_entity_ids = frozenset(entity_ids)
+        requested_relationship_ids = frozenset(relationship_ids)
+
+        public_relationships: dict[str, LayeredRelationship] = {}
+        public_entity_ids = set(requested_entity_ids)
+        public_semantic_bytes = 0
+        for relationship_id in sorted(requested_relationship_ids):
+            public_relationship_row = (
+                self._public_repository.get_public_relationship(
+                    graph_id,
+                    relationship_id,
+                )
+            )
+            if public_relationship_row is None:
+                continue
+            projected_public_relationship = (
+                self._decode_public_relationship(
+                    graph_id,
+                    public_relationship_row,
+                )
+            )
+            public_semantic_bytes += self._semantic_size(
+                projected_public_relationship.kind,
+                projected_public_relationship.properties,
+            )
+            if public_semantic_bytes > MAX_PUBLIC_SNAPSHOT_JSON_BYTES:
+                raise ValidationError(
+                    "The targeted public graph exceeds its byte limit."
+                )
+            public_relationships[relationship_id] = (
+                projected_public_relationship
+            )
+            public_entity_ids.update(
+                (
+                    projected_public_relationship.from_entity_id,
+                    projected_public_relationship.to_entity_id,
+                )
+            )
+
+        decoded_private_entities: dict[
+            str,
+            tuple[str, str, dict[str, Any]],
+        ] = {}
+        decoded_anchors: dict[str, tuple[str, str]] = {}
+        for scoped_entity in snapshot.entities:
+            if not isinstance(scoped_entity, ScopedEntity):
+                raise IntegrityViolation()
+            if scoped_entity.kind == PRIVATE_ENTITY_WRAPPER_KIND:
+                private_decoded = self._decode_private_entity(scoped_entity)
+                if scoped_entity.entity_id in decoded_private_entities:
+                    raise IntegrityViolation()
+                decoded_private_entities[scoped_entity.entity_id] = (
+                    private_decoded
+                )
+            elif scoped_entity.kind == PUBLIC_ANCHOR_WRAPPER_KIND:
+                anchor_decoded = self._decode_public_anchor(scoped_entity)
+                if scoped_entity.entity_id in decoded_anchors:
+                    raise IntegrityViolation()
+                decoded_anchors[scoped_entity.entity_id] = anchor_decoded
+                anchor_graph_id, public_entity_id = anchor_decoded
+                if anchor_graph_id == graph_id:
+                    public_entity_ids.add(public_entity_id)
+
+        entities: dict[str, LayeredEntity] = {}
+        for entity_id in sorted(public_entity_ids):
+            public_entity_row = self._public_repository.get_public_entity(
+                graph_id,
+                entity_id,
+            )
+            if public_entity_row is None:
+                continue
+            projected_public_entity = self._decode_public_entity(
+                graph_id,
+                public_entity_row,
+            )
+            public_semantic_bytes += self._semantic_size(
+                projected_public_entity.kind,
+                projected_public_entity.properties,
+            )
+            if public_semantic_bytes > MAX_PUBLIC_SNAPSHOT_JSON_BYTES:
+                raise ValidationError(
+                    "The targeted public graph exceeds its byte limit."
+                )
+            entities[entity_id] = projected_public_entity
+
+        for projected_public_relationship in public_relationships.values():
+            if (
+                projected_public_relationship.from_entity_id not in entities
+                or projected_public_relationship.to_entity_id not in entities
+            ):
+                raise IntegrityViolation()
+
+        private_entity_ids: set[str] = set()
+        public_anchors: dict[str, str] = {}
+        unresolved_public_anchors: set[str] = set()
+        for entity_id, private_decoded in decoded_private_entities.items():
+            entity_graph_id, semantic_kind, semantic_properties = (
+                private_decoded
+            )
+            if entity_graph_id != graph_id:
+                continue
+            if entity_id in entities:
+                raise IntegrityViolation()
+            entities[entity_id] = LayeredEntity(
+                entity_id=entity_id,
+                kind=semantic_kind,
+                properties=semantic_properties,
+                protection=ProtectionLevel.PRIVATE,
+            )
+            private_entity_ids.add(entity_id)
+        for anchor_id, anchor_decoded in decoded_anchors.items():
+            anchor_graph_id, public_entity_id = anchor_decoded
+            if anchor_graph_id != graph_id:
+                continue
+            if public_entity_id in entities:
+                public_anchors[anchor_id] = public_entity_id
+            else:
+                unresolved_public_anchors.add(anchor_id)
+
+        relationships = dict(public_relationships)
+        endpoint_ids = (
+            private_entity_ids
+            | set(public_anchors)
+            | unresolved_public_anchors
+        )
+        for scoped_relationship in snapshot.relationships:
+            if (
+                not isinstance(scoped_relationship, ScopedRelationship)
+                or scoped_relationship.kind
+                != PRIVATE_RELATIONSHIP_WRAPPER_KIND
+            ):
+                continue
+            (
+                relationship_graph_id,
+                semantic_kind,
+                semantic_properties,
+            ) = self._decode_private_relationship(scoped_relationship)
+            if relationship_graph_id != graph_id:
+                continue
+            if scoped_relationship.relationship_id in relationships:
+                raise IntegrityViolation()
+            if (
+                scoped_relationship.from_entity_id not in endpoint_ids
+                or scoped_relationship.to_entity_id not in endpoint_ids
+            ):
+                raise IntegrityViolation()
+            if (
+                scoped_relationship.from_entity_id
+                in unresolved_public_anchors
+                or scoped_relationship.to_entity_id
+                in unresolved_public_anchors
+            ):
+                continue
+            from_entity_id = public_anchors.get(
+                scoped_relationship.from_entity_id,
+                scoped_relationship.from_entity_id,
+            )
+            to_entity_id = public_anchors.get(
+                scoped_relationship.to_entity_id,
+                scoped_relationship.to_entity_id,
+            )
+            if from_entity_id not in entities or to_entity_id not in entities:
+                raise IntegrityViolation()
+            relationships[scoped_relationship.relationship_id] = (
+                LayeredRelationship(
+                    relationship_id=scoped_relationship.relationship_id,
                     from_entity_id=from_entity_id,
                     to_entity_id=to_entity_id,
                     kind=semantic_kind,
@@ -1088,8 +1576,8 @@ class AuthGraph:
         entities: dict[str, LayeredEntity] = {}
         relationships: dict[str, LayeredRelationship] = {}
         semantic_bytes = 0
-        for row in snapshot.entities:
-            entity = self._decode_public_entity(graph_id, row)
+        for entity_row in snapshot.entities:
+            entity = self._decode_public_entity(graph_id, entity_row)
             if entity.entity_id in entities:
                 raise IntegrityViolation()
             semantic_bytes += self._semantic_size(
@@ -1102,8 +1590,11 @@ class AuthGraph:
                 )
             entities[entity.entity_id] = entity
 
-        for row in snapshot.relationships:
-            relationship = self._decode_public_relationship(graph_id, row)
+        for relationship_row in snapshot.relationships:
+            relationship = self._decode_public_relationship(
+                graph_id,
+                relationship_row,
+            )
             if (
                 relationship.relationship_id in relationships
                 or relationship.from_entity_id not in entities
@@ -1148,6 +1639,7 @@ class AuthGraph:
                 raise IntegrityViolation()
             _validate_id(row.entity_id, "Invalid public entity identifier.")
             _validate_kind(row.kind)
+            _validate_record_revision(row.record_revision)
             properties = _copy_json_properties(row.properties)
         except ValidationError:
             raise IntegrityViolation() from None
@@ -1176,6 +1668,7 @@ class AuthGraph:
             _validate_id(row.from_entity_id, "Invalid public endpoint.")
             _validate_id(row.to_entity_id, "Invalid public endpoint.")
             _validate_kind(row.kind)
+            _validate_record_revision(row.record_revision)
             properties = _copy_json_properties(row.properties)
         except ValidationError:
             raise IntegrityViolation() from None

@@ -19,11 +19,11 @@ import secrets
 import threading
 import time
 import unicodedata
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Callable, Protocol, runtime_checkable
+from typing import Protocol, runtime_checkable
 
 from .errors import AuthGraphError, ValidationError
-
 
 DEFAULT_CODE_DIGITS = 6
 MIN_CODE_DIGITS = 6
@@ -399,10 +399,9 @@ class InMemoryOneTimeCodeBroker:
             or authorization_epoch > (2**63 - 1)
         ):
             raise ValidationError("Invalid authorization epoch.")
+        value = secrets.randbelow(10**self._code_digits)
         code = bytearray(
-            f"{secrets.randbelow(10 ** self._code_digits):0{self._code_digits}d}".encode(
-                "ascii"
-            )
+            f"{value:0{self._code_digits}d}".encode("ascii")
         )
         try:
             now = self._clock_value(self._clock)
@@ -570,6 +569,7 @@ class InMemoryOneTimeCodeBroker:
                     and active_matches
                 )
                 if accepted:
+                    assert record is not None
                     expires_at = record.expires_at
                     self._remove_record_locked(challenge_digest)
                     snapshot = _EvidenceSnapshot(

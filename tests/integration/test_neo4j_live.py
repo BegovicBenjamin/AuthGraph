@@ -20,7 +20,6 @@ import unittest
 import uuid
 from pathlib import Path
 
-
 RUN_LIVE = os.environ.get("AUTHGRAPH_RUN_NEO4J_TESTS") == "1"
 
 
@@ -55,10 +54,9 @@ class LiveNeo4jTests(unittest.TestCase):
                 + ", ".join(missing)
             )
 
-        from neo4j import GraphDatabase
-
         from authgraph.cli import _validated_uri
         from authgraph.neo4j_schema import apply_schema, verify_schema
+        from neo4j import GraphDatabase
 
         uri = _validated_uri(required["AUTHGRAPH_TEST_NEO4J_URI"])
         username = required["AUTHGRAPH_TEST_NEO4J_USERNAME"]
@@ -100,6 +98,7 @@ class LiveNeo4jTests(unittest.TestCase):
 
     def setUp(self) -> None:
         self.created_vaults: list[tuple[str, str]] = []
+        self.created_public_graphs: list[str] = []
         self.sessions: list[object] = []
 
     def tearDown(self) -> None:
@@ -107,6 +106,28 @@ class LiveNeo4jTests(unittest.TestCase):
             sessions.close_all()
         for principal_id, vault_id in reversed(self.created_vaults):
             self._delete_exact_vault(principal_id, vault_id)
+        for graph_id in reversed(self.created_public_graphs):
+            self._delete_exact_public_graph(graph_id)
+
+    def _delete_exact_public_graph(self, graph_id: str) -> None:
+        # Cleanup is rooted at one random graph ID and never scans/deletes an
+        # unrelated public graph.
+        for query in (
+            """
+            MATCH (:AGPublicGraph {graph_id: $graph_id})
+              -[:AG_PUBLIC_OWNS]->(entity:AGPublicEntity)
+            DETACH DELETE entity
+            """,
+            """
+            MATCH (graph:AGPublicGraph {graph_id: $graph_id})
+            DETACH DELETE graph
+            """,
+        ):
+            self.driver.execute_query(
+                query,
+                graph_id=graph_id,
+                database_=self.database,
+            )
 
     def _delete_exact_vault(
         self,
@@ -222,6 +243,13 @@ class LiveNeo4jTests(unittest.TestCase):
             {"order_number": f"ORDER-{run_id}"},
             idempotency_key=f"entity-order-{run_id}",
         )
+        unrelated_entity = service.create_entity(
+            context,
+            scope_id,
+            "PrivateNote",
+            {"note": f"unrelated-{run_id}"},
+            idempotency_key=f"entity-unrelated-{run_id}",
+        )
         relationship_id = service.connect(
             context,
             scope_id,
@@ -242,6 +270,23 @@ class LiveNeo4jTests(unittest.TestCase):
                 idempotency_key=f"relationship-placed-{run_id}",
             ),
             relationship_id,
+        )
+        targeted = service.get_targeted_snapshot(
+            context,
+            (second_entity,),
+            (relationship_id,),
+        )
+        self.assertEqual(
+            {entity.entity_id for entity in targeted.entities},
+            {first_entity, second_entity},
+        )
+        self.assertEqual(
+            [row.relationship_id for row in targeted.relationships],
+            [relationship_id],
+        )
+        self.assertNotIn(
+            unrelated_entity,
+            {entity.entity_id for entity in targeted.entities},
         )
         self.assertEqual(
             service.get_entity(context, first_entity).properties[
@@ -414,9 +459,251 @@ class LiveNeo4jTests(unittest.TestCase):
             second_entity,
             expected_revision=1,
         )
+        service.delete_entity(
+            context,
+            unrelated_entity,
+            expected_revision=1,
+        )
         with self.assertRaises(RecordNotFound):
             service.get_entity(context, first_entity)
         service.lock(context)
+
+    def test_layered_public_crud_and_mixed_edge_are_retry_safe(self) -> None:
+        from authgraph import (
+            AuthGraph,
+            ConflictError,
+            CryptoEngine,
+            GraphPolicy,
+            Neo4jPublicGraphRepository,
+            Neo4jScopedGraphRepository,
+            ProtectionLevel,
+            ScopedAuthGraphService,
+            ScopedSessionBroker,
+        )
+        from authgraph.models import KdfParameters
+
+        run_id = uuid.uuid4().hex
+        graph_id = f"live-layered-{run_id}"
+        self.created_public_graphs.append(graph_id)
+        publisher = object()
+        sessions = ScopedSessionBroker(
+            default_ttl_seconds=30,
+            max_ttl_seconds=30,
+            sweep_interval_seconds=None,
+        )
+        self.sessions.append(sessions)
+        private = ScopedAuthGraphService(
+            Neo4jScopedGraphRepository(self.driver, database=self.database),
+            CryptoEngine(
+                KdfParameters.insecure_for_testing(),
+                allow_insecure_kdf_for_testing=True,
+            ),
+            sessions,
+        )
+        graph = AuthGraph(
+            private,
+            Neo4jPublicGraphRepository(self.driver, database=self.database),
+            graph_policies={
+                graph_id: GraphPolicy(allow_public_overrides=True)
+            },
+            public_write_authorizer=(
+                lambda candidate, requested_graph: (
+                    candidate is publisher and requested_graph == graph_id
+                )
+            ),
+        )
+
+        first = graph.create_entity(
+            graph_id,
+            "Product",
+            {"name": f"Synthetic product {run_id}"},
+            protection=ProtectionLevel.PUBLIC,
+            publisher=publisher,
+            idempotency_key="public-product-first",
+        )
+        self.assertEqual(
+            graph.create_entity(
+                graph_id,
+                "Product",
+                {"name": f"Synthetic product {run_id}"},
+                protection=ProtectionLevel.PUBLIC,
+                publisher=publisher,
+                idempotency_key="public-product-first",
+            ),
+            first,
+        )
+        second = graph.create_entity(
+            graph_id,
+            "Product",
+            {"name": "Synthetic accessory"},
+            protection=ProtectionLevel.PUBLIC,
+            publisher=publisher,
+            idempotency_key="public-product-second",
+        )
+        public_link = graph.connect(
+            graph_id,
+            first,
+            second,
+            "COMPATIBLE_WITH",
+            {"source": "live-test"},
+            protection=ProtectionLevel.PUBLIC,
+            publisher=publisher,
+            idempotency_key="public-link",
+        )
+        self.assertEqual(
+            graph.connect(
+                graph_id,
+                first,
+                second,
+                "COMPATIBLE_WITH",
+                {"source": "live-test"},
+                protection=ProtectionLevel.PUBLIC,
+                publisher=publisher,
+                idempotency_key="public-link",
+            ),
+            public_link,
+        )
+        updated_public = graph.update_entity(
+            graph_id,
+            first,
+            "Product",
+            {"name": f"Updated synthetic product {run_id}"},
+            expected_revision=1,
+            publisher=publisher,
+        )
+        self.assertEqual(updated_public.record_revision, 2)
+        with self.assertRaises(ConflictError):
+            graph.update_entity(
+                graph_id,
+                first,
+                "Product",
+                {"name": "stale"},
+                expected_revision=1,
+                publisher=publisher,
+            )
+        updated_public_link = graph.update_relationship(
+            graph_id,
+            public_link,
+            "COMPATIBLE_WITH",
+            {"source": "updated-live-test"},
+            expected_revision=1,
+            publisher=publisher,
+        )
+        self.assertEqual(updated_public_link.record_revision, 2)
+
+        principal = f"idp|authgraph-layered-live|{run_id}"
+        passphrase = bytearray(b"synthetic layered live passphrase")
+        vault_id = graph.create_vault(principal, passphrase)
+        self.created_vaults.append((principal, vault_id))
+        scope_id = graph.create_scope(principal, vault_id, passphrase)
+        context = graph.unlock(
+            principal,
+            vault_id,
+            passphrase,
+            (scope_id,),
+        )
+        passphrase[:] = b"\x00" * len(passphrase)
+        private_sentinel = f"private-layered-sentinel-{run_id}"
+        private_customer = graph.create_entity(
+            graph_id,
+            "Customer",
+            {"private_note": private_sentinel},
+            context=context,
+            scope_id=scope_id,
+            idempotency_key="private-customer",
+        )
+        mixed = graph.connect(
+            graph_id,
+            private_customer,
+            first,
+            "INTERESTED_IN",
+            {"private_reason": private_sentinel},
+            context=context,
+            scope_id=scope_id,
+            idempotency_key="mixed-link",
+        )
+        self.assertEqual(
+            graph.connect(
+                graph_id,
+                private_customer,
+                first,
+                "INTERESTED_IN",
+                {"private_reason": private_sentinel},
+                context=context,
+                scope_id=scope_id,
+                idempotency_key="mixed-link",
+            ),
+            mixed,
+        )
+        resolved_mixed = graph.get_relationship(
+            graph_id,
+            mixed,
+            context=context,
+        )
+        self.assertEqual(resolved_mixed.from_entity_id, private_customer.entity_id)
+        self.assertEqual(resolved_mixed.to_entity_id, first.entity_id)
+        self.assertEqual(
+            resolved_mixed.properties["private_reason"],
+            private_sentinel,
+        )
+
+        stored = self.driver.execute_query(
+            """
+            MATCH ()-[link:AG_SCOPED_LINK {
+                relationship_id: $relationship_id
+            }]->()
+            RETURN link.ciphertext AS ciphertext, keys(link) AS property_keys
+            """,
+            relationship_id=mixed.relationship_id,
+            database_=self.database,
+        ).records[0]
+        self.assertNotIn(
+            private_sentinel.encode("utf-8"),
+            bytes(stored["ciphertext"]),
+        )
+        self.assertNotIn("kind", stored["property_keys"])
+
+        updated_mixed = graph.update_relationship(
+            graph_id,
+            mixed,
+            "INTERESTED_IN",
+            {"private_reason": "updated synthetic reason"},
+            context=context,
+            expected_revision=1,
+        )
+        self.assertEqual(updated_mixed.record_revision, 2)
+        graph.delete_relationship(
+            graph_id,
+            mixed,
+            context=context,
+            expected_revision=2,
+        )
+        graph.delete_entity(
+            graph_id,
+            private_customer,
+            context=context,
+            expected_revision=1,
+        )
+        graph.lock(context)
+
+        graph.delete_relationship(
+            graph_id,
+            public_link,
+            expected_revision=2,
+            publisher=publisher,
+        )
+        graph.delete_entity(
+            graph_id,
+            first,
+            expected_revision=2,
+            publisher=publisher,
+        )
+        graph.delete_entity(
+            graph_id,
+            second,
+            expected_revision=1,
+            publisher=publisher,
+        )
 
 
 if __name__ == "__main__":

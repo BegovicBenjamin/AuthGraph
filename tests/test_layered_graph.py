@@ -6,8 +6,8 @@ from dataclasses import replace
 from unittest.mock import patch
 
 from authgraph import (
-    AuthorizationDenied,
     AuthGraphService,
+    AuthorizationDenied,
     CryptoEngine,
     GraphEntityRef,
     GraphPolicy,
@@ -24,16 +24,16 @@ from authgraph import (
     SessionUnavailable,
     ValidationError,
 )
-from authgraph.models import (
-    PublicEntityRow,
-    PublicGraphSnapshotRow,
-    PublicRelationshipRow,
-)
 from authgraph.layered_service import (
     MAX_PUBLIC_SNAPSHOT_JSON_BYTES,
     PRIVATE_ENTITY_WRAPPER_KIND,
     PRIVATE_RELATIONSHIP_WRAPPER_KIND,
     PUBLIC_ANCHOR_WRAPPER_KIND,
+)
+from authgraph.models import (
+    PublicEntityRow,
+    PublicGraphSnapshotRow,
+    PublicRelationshipRow,
 )
 from authgraph.neo4j_public_repository import (
     IncompleteCommit as PublicIncompleteCommit,
@@ -948,6 +948,7 @@ class LayeredGraphTests(unittest.TestCase):
                                 "entity_id": "public_e1",
                                 "kind": "Topic",
                                 "properties_json": '{"name":"Visible"}',
+                                "record_revision": 1,
                             }
                         ],
                         "relationships": [],
@@ -974,6 +975,7 @@ class LayeredGraphTests(unittest.TestCase):
         self.assertIn("AGPublicEntity", put_query)
         parameters = put_kwargs["parameters_"]
         self.assertEqual(parameters["properties_json"], '{"name":"Visible"}')
+        self.assertEqual(parameters["record_revision"], 1)
         self.assertEqual(put_kwargs["database_"], "neo4j")
         snapshot_parameters = driver.calls[1][1]["parameters_"]
         self.assertEqual(snapshot_parameters["entity_fetch_limit"], 11)
@@ -1005,6 +1007,7 @@ class LayeredGraphTests(unittest.TestCase):
                                 "entity_id": "public_e1",
                                 "kind": "Topic",
                                 "properties_json": "[]",
+                                "record_revision": 1,
                             }
                         ],
                         "relationships": [],
@@ -1047,14 +1050,18 @@ class LayeredGraphTests(unittest.TestCase):
             parameters["properties_json"],
             '{"visible":true}',
         )
+        self.assertEqual(parameters["record_revision"], 1)
 
         ambiguous_driver = RecordingDriver(
             [
                 PublicIncompleteCommit(),
                 [
                     {
+                        "from_entity_id": "public_e1",
+                        "to_entity_id": "public_e2",
                         "kind": "RELATES_TO",
                         "properties_json": '{"visible":true}',
+                        "record_revision": 1,
                     }
                 ],
             ]
@@ -1071,6 +1078,213 @@ class LayeredGraphTests(unittest.TestCase):
             database="neo4j",
         )
         self.assertFalse(missing_repository.put_public_relationship(row))
+
+    def test_neo4j_public_crud_uses_revision_checked_fixed_queries(
+        self,
+    ) -> None:
+        driver = RecordingDriver(
+            [
+                [
+                    {
+                        "kind": "Topic",
+                        "properties_json": '{"name":"Visible"}',
+                        "record_revision": 1,
+                    }
+                ],
+                [{"updated": 1}],
+                [{"deleted": 1}],
+                [
+                    {
+                        "from_entity_id": "public_e1",
+                        "to_entity_id": "public_e2",
+                        "kind": "RELATES_TO",
+                        "properties_json": '{"rank":1}',
+                        "record_revision": 1,
+                    }
+                ],
+                [{"updated": 1}],
+                [{"deleted": 1}],
+            ]
+        )
+        repository = Neo4jPublicGraphRepository(driver, database="neo4j")
+        entity = repository.get_public_entity("base-graph", "public_e1")
+        self.assertIsNotNone(entity)
+        assert entity is not None
+        self.assertEqual(entity.record_revision, 1)
+        updated_entity = replace(
+            entity,
+            properties={"name": "Updated"},
+            record_revision=2,
+        )
+        self.assertTrue(
+            repository.replace_public_entity(
+                "base-graph",
+                "public_e1",
+                1,
+                updated_entity,
+            )
+        )
+        self.assertTrue(
+            repository.delete_public_entity(
+                "base-graph",
+                "public_e1",
+                2,
+            )
+        )
+
+        relationship = repository.get_public_relationship(
+            "base-graph",
+            "public_r1",
+        )
+        self.assertIsNotNone(relationship)
+        assert relationship is not None
+        self.assertEqual(relationship.from_entity_id, "public_e1")
+        updated_relationship = replace(
+            relationship,
+            properties={"rank": 2},
+            record_revision=2,
+        )
+        self.assertTrue(
+            repository.replace_public_relationship(
+                "base-graph",
+                "public_r1",
+                1,
+                updated_relationship,
+            )
+        )
+        self.assertTrue(
+            repository.delete_public_relationship(
+                "base-graph",
+                "public_r1",
+                2,
+            )
+        )
+
+        self.assertEqual(
+            driver.calls[1][0],
+            Neo4jPublicGraphRepository._REPLACE_PUBLIC_ENTITY,
+        )
+        entity_update_parameters = driver.calls[1][1]["parameters_"]
+        self.assertEqual(entity_update_parameters["expected_revision"], 1)
+        self.assertEqual(entity_update_parameters["record_revision"], 2)
+        self.assertIn(
+            "SET entity._authgraph_lock = true",
+            driver.calls[1][0],
+        )
+        self.assertIn(
+            "NOT EXISTS",
+            Neo4jPublicGraphRepository._DELETE_PUBLIC_ENTITY,
+        )
+        self.assertEqual(
+            driver.calls[4][0],
+            Neo4jPublicGraphRepository._REPLACE_PUBLIC_RELATIONSHIP,
+        )
+        relationship_update_parameters = driver.calls[4][1]["parameters_"]
+        self.assertEqual(
+            relationship_update_parameters["from_entity_id"],
+            "public_e1",
+        )
+        self.assertEqual(
+            relationship_update_parameters["to_entity_id"],
+            "public_e2",
+        )
+        self.assertIn(
+            "SET link._authgraph_lock = true",
+            driver.calls[4][0],
+        )
+
+    def test_neo4j_public_crud_reconciles_ambiguous_commits(self) -> None:
+        updated_entity = PublicEntityRow(
+            graph_id="base-graph",
+            entity_id="public_e1",
+            kind="Topic",
+            properties={"name": "Updated"},
+            record_revision=2,
+        )
+        entity_update_driver = RecordingDriver(
+            [
+                PublicIncompleteCommit(),
+                [
+                    {
+                        "kind": "Topic",
+                        "properties_json": '{"name":"Updated"}',
+                        "record_revision": 2,
+                    }
+                ],
+            ]
+        )
+        entity_update_repository = Neo4jPublicGraphRepository(
+            entity_update_driver,
+            database="neo4j",
+        )
+        self.assertTrue(
+            entity_update_repository.replace_public_entity(
+                "base-graph",
+                "public_e1",
+                1,
+                updated_entity,
+            )
+        )
+
+        entity_delete_repository = Neo4jPublicGraphRepository(
+            RecordingDriver([PublicIncompleteCommit(), []]),
+            database="neo4j",
+        )
+        self.assertTrue(
+            entity_delete_repository.delete_public_entity(
+                "base-graph",
+                "public_e1",
+                2,
+            )
+        )
+
+        updated_relationship = PublicRelationshipRow(
+            graph_id="base-graph",
+            relationship_id="public_r1",
+            from_entity_id="public_e1",
+            to_entity_id="public_e2",
+            kind="RELATES_TO",
+            properties={"rank": 2},
+            record_revision=2,
+        )
+        relationship_update_driver = RecordingDriver(
+            [
+                PublicIncompleteCommit(),
+                [
+                    {
+                        "from_entity_id": "public_e1",
+                        "to_entity_id": "public_e2",
+                        "kind": "RELATES_TO",
+                        "properties_json": '{"rank":2}',
+                        "record_revision": 2,
+                    }
+                ],
+            ]
+        )
+        relationship_update_repository = Neo4jPublicGraphRepository(
+            relationship_update_driver,
+            database="neo4j",
+        )
+        self.assertTrue(
+            relationship_update_repository.replace_public_relationship(
+                "base-graph",
+                "public_r1",
+                1,
+                updated_relationship,
+            )
+        )
+
+        relationship_delete_repository = Neo4jPublicGraphRepository(
+            RecordingDriver([PublicIncompleteCommit(), []]),
+            database="neo4j",
+        )
+        self.assertTrue(
+            relationship_delete_repository.delete_public_relationship(
+                "base-graph",
+                "public_r1",
+                2,
+            )
+        )
 
 
 if __name__ == "__main__":

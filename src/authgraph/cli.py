@@ -5,20 +5,22 @@ from __future__ import annotations
 import argparse
 import getpass
 import os
+import stat
 import sys
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Never
 from urllib.parse import urlsplit
 
 from .neo4j_schema import (
     EXPECTED_CONSTRAINTS,
     EXPECTED_INDEXES,
     SchemaApplyError,
+    SchemaMigrationError,
     SchemaVerificationError,
     apply_schema,
     verify_schema,
 )
-
 
 _SECURE_NEO4J_SCHEMES = {
     "bolt+s",
@@ -44,7 +46,7 @@ class _SafeArgumentParser(argparse.ArgumentParser):
         kwargs.setdefault("allow_abbrev", False)
         super().__init__(*args, **kwargs)
 
-    def error(self, message: str) -> None:
+    def error(self, message: str) -> Never:
         self.print_usage(sys.stderr)
         self.exit(2, f"{self.prog}: error: invalid arguments\n")
 
@@ -123,6 +125,8 @@ def _validated_uri(value: Any) -> str:
         or parsed.username is not None
         or parsed.password is not None
         or parsed.path not in ("", "/")
+        or parsed.query
+        or parsed.fragment
         or (port is not None and not 1 <= port <= 65535)
     ):
         raise _CliInputError(
@@ -144,20 +148,50 @@ def _read_password(path_value: Any, *, no_input: bool) -> str:
     else:
         path_text = _required_text(path_value, "Password file")
         path = Path(path_text)
+        descriptor: int | None = None
         try:
-            if not path.is_file() or path.stat().st_size > _MAX_SECRET_FILE_BYTES:
+            flags = os.O_RDONLY
+            flags |= getattr(os, "O_CLOEXEC", 0)
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(path, flags)
+            metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_size > _MAX_SECRET_FILE_BYTES
+            ):
                 raise _CliInputError(
                     "Password file must be a small regular file."
                 )
-            password = path.read_text(encoding="utf-8")
+            if os.name == "posix" and (
+                metadata.st_uid != os.geteuid()
+                or stat.S_IMODE(metadata.st_mode) & 0o077
+            ):
+                raise _CliInputError(
+                    "Password file must be owned by this user and mode 0600."
+                )
+            with os.fdopen(
+                descriptor,
+                "r",
+                encoding="utf-8",
+                newline="",
+            ) as password_file:
+                descriptor = None
+                password = password_file.read(_MAX_SECRET_FILE_BYTES + 1)
         except _CliInputError:
             raise
         except (OSError, UnicodeError) as exc:
             raise _CliInputError("Could not read the password file.") from exc
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+        if len(password.encode("utf-8")) > _MAX_SECRET_FILE_BYTES:
+            raise _CliInputError("Password file must be a small regular file.")
         if password.endswith("\r\n"):
             password = password[:-2]
         elif password.endswith("\n"):
             password = password[:-1]
+        if "\r" in password or "\n" in password:
+            raise _CliInputError("Password file must contain exactly one line.")
 
     if not password or "\x00" in password:
         raise _CliInputError("Neo4j password must not be empty.")
@@ -206,10 +240,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         with _open_driver(uri, username, password) as driver:
             driver.verify_connectivity()
             if args.schema_command == "apply":
-                apply_schema(driver, database=database)
+                report = apply_schema(driver, database=database)
                 action = "applied and verified"
             else:
-                verify_schema(driver, database=database)
+                report = verify_schema(driver, database=database)
                 action = "verified"
     except SchemaVerificationError as exc:
         _print_verification_failure(exc)
@@ -218,6 +252,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(
             f"AuthGraph could not apply schema object "
             f"{exc.statement_name!r}.",
+            file=sys.stderr,
+        )
+        return 1
+    except SchemaMigrationError:
+        print(
+            "AuthGraph could not migrate its schema metadata safely.",
             file=sys.stderr,
         )
         return 1
@@ -239,7 +279,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(
         f"AuthGraph schema {action}: "
         f"{len(EXPECTED_CONSTRAINTS)} constraints and "
-        f"{len(EXPECTED_INDEXES)} indexes."
+        f"{len(EXPECTED_INDEXES)} indexes (schema v{report.schema_version})."
     )
     return 0
 

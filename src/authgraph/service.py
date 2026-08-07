@@ -17,6 +17,7 @@ from .errors import (
     ConflictError,
     IntegrityViolation,
     RecordNotFound,
+    SessionUnavailable,
     UnlockDenied,
     ValidationError,
 )
@@ -27,12 +28,11 @@ from .models import (
     Entity,
     Neighborhood,
     Relationship,
-    VaultSnapshot,
     VaultRow,
+    VaultSnapshot,
 )
 from .repository import GraphRepository
-from .sessions import InMemorySessionBroker, SessionLease
-
+from .sessions import SessionBroker, SessionLease
 
 MAX_ID_CHARS = 256
 MAX_KIND_CHARS = 128
@@ -110,7 +110,7 @@ class AuthGraphService:
         self,
         repository: GraphRepository,
         crypto: CryptoEngine,
-        sessions: InMemorySessionBroker,
+        sessions: SessionBroker,
     ) -> None:
         self._repository = repository
         self._crypto = crypto
@@ -223,35 +223,49 @@ class AuthGraphService:
                     envelope_revision=next_revision,
                     key_version=row.envelope.key_version,
                 )
-                # Reserve/register only after validating the new passphrase,
-                # but before the database commit, so broker capacity cannot
-                # fail after changing the password.
-                self._sessions.advance_envelope_revision(
+                transition = self._sessions.prepare_revision_change(
                     principal_id,
                     vault_id,
                     row.envelope.envelope_revision,
+                    next_revision,
                 )
-                try:
-                    if not self._repository.replace_envelope(
-                        principal_id,
-                        vault_id,
-                        row.envelope.envelope_revision,
-                        envelope,
-                    ):
-                        raise UnlockDenied()
-                    self._sessions.advance_envelope_revision(
-                        principal_id,
-                        vault_id,
-                        next_revision,
-                    )
-                except Exception:
-                    # The database commit may be unknown, or another worker may
-                    # have won the CAS. Conservatively remove every local DEK
-                    # session instead of retaining an ambiguously stale key.
-                    self._sessions.revoke_vault(principal_id, vault_id)
-                    raise
+                if not self._repository.replace_envelope(
+                    principal_id,
+                    vault_id,
+                    row.envelope.envelope_revision,
+                    envelope,
+                ):
+                    # A false CAS or lost acknowledgement is not proof of the
+                    # graph's authoritative revision. Leave REVISION_PENDING.
+                    raise UnlockDenied()
+                self._sessions.finalize_revision_change(transition)
             finally:
                 clear_bytearray(dek)
+
+    def reconcile_passphrase_change(
+        self,
+        principal_id: str,
+        vault_id: str,
+    ) -> int:
+        """Resolve a pending password change from the authoritative graph row.
+
+        This is a trusted operator path, not a chatbot/user tool. It deliberately
+        refuses to infer state when the graph row is absent or its revision does
+        not exactly match the stored pending ``current``/``next`` metadata.
+        """
+
+        _validate_opaque_principal_id(principal_id)
+        _validate_opaque_vault_id(vault_id)
+        with self._sessions.vault_guard(principal_id, vault_id):
+            row = self._repository.get_vault(principal_id, vault_id)
+            if row is None:
+                raise SessionUnavailable()
+            state = self._sessions.reconcile_revision_change(
+                principal_id,
+                vault_id,
+                row.envelope.envelope_revision,
+            )
+            return state.current_revision
 
     def create_entity(
         self,
@@ -626,18 +640,24 @@ class AuthGraphService:
                 )
             try:
                 ciphertext_bytes = sum(
-                    len(row.payload.ciphertext)
-                    for row in (
-                        *encrypted.entities,
-                        *encrypted.relationships,
-                    )
+                    len(entity_row.payload.ciphertext)
+                    for entity_row in encrypted.entities
+                ) + sum(
+                    len(relationship_row.payload.ciphertext)
+                    for relationship_row in encrypted.relationships
                 )
-                for row in encrypted.entities:
-                    _validate_opaque_object_id(row.entity_id)
-                for row in encrypted.relationships:
-                    _validate_opaque_object_id(row.relationship_id)
-                    _validate_opaque_object_id(row.from_entity_id)
-                    _validate_opaque_object_id(row.to_entity_id)
+                for entity_row in encrypted.entities:
+                    _validate_opaque_object_id(entity_row.entity_id)
+                for relationship_row in encrypted.relationships:
+                    _validate_opaque_object_id(
+                        relationship_row.relationship_id
+                    )
+                    _validate_opaque_object_id(
+                        relationship_row.from_entity_id
+                    )
+                    _validate_opaque_object_id(
+                        relationship_row.to_entity_id
+                    )
             except (
                 AttributeError,
                 OverflowError,

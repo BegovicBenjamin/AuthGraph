@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Iterable, Mapping
+from collections.abc import Iterable, Mapping
+from typing import TYPE_CHECKING, Any
 
 from .errors import IntegrityViolation, ValidationError
 from .models import (
@@ -12,11 +13,14 @@ from .models import (
     PublicRelationshipRow,
 )
 
-try:
+if TYPE_CHECKING:
     from neo4j.exceptions import IncompleteCommit
-except ImportError:  # Unit tests do not require the runtime driver.
-    class IncompleteCommit(Exception):
-        """Fallback type used only when the Neo4j driver is not installed."""
+else:
+    try:
+        from neo4j.exceptions import IncompleteCommit
+    except ImportError:  # Unit tests do not require the runtime driver.
+        class IncompleteCommit(Exception):
+            """Fallback used only when the Neo4j driver is unavailable."""
 
 
 MAX_PUBLIC_JSON_BYTES = 64 * 1024
@@ -35,14 +39,17 @@ class Neo4jPublicGraphRepository:
     SET graph._authgraph_lock = true
     REMOVE graph._authgraph_lock
     WITH graph
-    WHERE NOT EXISTS {
-        MATCH (:AGPublicEntity {entity_id: $entity_id})
-    }
+    WHERE
+        $record_revision = 1
+        AND NOT EXISTS {
+            MATCH (:AGPublicEntity {entity_id: $entity_id})
+        }
     CREATE (entity:AGPublicEntity {
         graph_id: $graph_id,
         entity_id: $entity_id,
         kind: $kind,
-        properties_json: $properties_json
+        properties_json: $properties_json,
+        record_revision: $record_revision
     })
     CREATE (graph)-[:AG_PUBLIC_OWNS]->(entity)
     RETURN count(entity) AS created
@@ -57,8 +64,48 @@ class Neo4jPublicGraphRepository:
     })
     RETURN
         entity.kind AS kind,
-        entity.properties_json AS properties_json
+        entity.properties_json AS properties_json,
+        coalesce(entity.record_revision, 1) AS record_revision
     LIMIT 1
+    """
+
+    _REPLACE_PUBLIC_ENTITY = """
+    MATCH (graph:AGPublicGraph {
+        graph_id: $graph_id
+    })-[:AG_PUBLIC_OWNS]->(entity:AGPublicEntity {
+        graph_id: $graph_id,
+        entity_id: $entity_id
+    })
+    SET entity._authgraph_lock = true
+    REMOVE entity._authgraph_lock
+    WITH entity
+    WHERE
+        coalesce(entity.record_revision, 1) = $expected_revision
+        AND $record_revision = $expected_revision + 1
+    SET
+        entity.kind = $kind,
+        entity.properties_json = $properties_json,
+        entity.record_revision = $record_revision
+    RETURN count(entity) AS updated
+    """
+
+    _DELETE_PUBLIC_ENTITY = """
+    MATCH (graph:AGPublicGraph {
+        graph_id: $graph_id
+    })-[ownership:AG_PUBLIC_OWNS]->(entity:AGPublicEntity {
+        graph_id: $graph_id,
+        entity_id: $entity_id
+    })
+    SET entity._authgraph_lock = true
+    REMOVE entity._authgraph_lock
+    WITH ownership, entity
+    WHERE
+        coalesce(entity.record_revision, 1) = $expected_revision
+        AND NOT EXISTS {
+            MATCH (entity)-[:AG_PUBLIC_LINK]-()
+        }
+    DELETE ownership, entity
+    RETURN 1 AS deleted
     """
 
     _PUT_PUBLIC_RELATIONSHIP = """
@@ -74,16 +121,19 @@ class Neo4jPublicGraphRepository:
         graph_id: $graph_id,
         entity_id: $to_entity_id
     })
-    WHERE NOT EXISTS {
-        MATCH ()-[existing:AG_PUBLIC_LINK {
-            relationship_id: $relationship_id
-        }]->()
-    }
+    WHERE
+        $record_revision = 1
+        AND NOT EXISTS {
+            MATCH ()-[existing:AG_PUBLIC_LINK {
+                relationship_id: $relationship_id
+            }]->()
+        }
     CREATE (source)-[link:AG_PUBLIC_LINK {
         graph_id: $graph_id,
         relationship_id: $relationship_id,
         kind: $kind,
-        properties_json: $properties_json
+        properties_json: $properties_json,
+        record_revision: $record_revision
     }]->(target)
     RETURN count(link) AS created
     """
@@ -91,22 +141,70 @@ class Neo4jPublicGraphRepository:
     _GET_PUBLIC_RELATIONSHIP = """
     MATCH (graph:AGPublicGraph {
         graph_id: $graph_id
+    })-[:AG_PUBLIC_OWNS]->(source:AGPublicEntity {graph_id: $graph_id})
+    MATCH (source)-[link:AG_PUBLIC_LINK {
+        graph_id: $graph_id,
+        relationship_id: $relationship_id
+    }]->(target:AGPublicEntity {graph_id: $graph_id})
+    WHERE EXISTS {
+        MATCH (graph)-[:AG_PUBLIC_OWNS]->(target)
+    }
+    RETURN
+        source.entity_id AS from_entity_id,
+        target.entity_id AS to_entity_id,
+        link.kind AS kind,
+        link.properties_json AS properties_json,
+        coalesce(link.record_revision, 1) AS record_revision
+    LIMIT 1
+    """
+
+    _REPLACE_PUBLIC_RELATIONSHIP = """
+    MATCH (graph:AGPublicGraph {
+        graph_id: $graph_id
     })-[:AG_PUBLIC_OWNS]->(source:AGPublicEntity {
         graph_id: $graph_id,
         entity_id: $from_entity_id
     })
-    MATCH (graph)-[:AG_PUBLIC_OWNS]->(target:AGPublicEntity {
-        graph_id: $graph_id,
-        entity_id: $to_entity_id
-    })
     MATCH (source)-[link:AG_PUBLIC_LINK {
         graph_id: $graph_id,
         relationship_id: $relationship_id
-    }]->(target)
-    RETURN
-        link.kind AS kind,
-        link.properties_json AS properties_json
-    LIMIT 1
+    }]->(target:AGPublicEntity {
+        graph_id: $graph_id,
+        entity_id: $to_entity_id
+    })
+    WHERE EXISTS {
+        MATCH (graph)-[:AG_PUBLIC_OWNS]->(target)
+    }
+    SET link._authgraph_lock = true
+    REMOVE link._authgraph_lock
+    WITH link
+    WHERE
+        coalesce(link.record_revision, 1) = $expected_revision
+        AND $record_revision = $expected_revision + 1
+    SET
+        link.kind = $kind,
+        link.properties_json = $properties_json,
+        link.record_revision = $record_revision
+    RETURN count(link) AS updated
+    """
+
+    _DELETE_PUBLIC_RELATIONSHIP = """
+    MATCH (graph:AGPublicGraph {
+        graph_id: $graph_id
+    })-[:AG_PUBLIC_OWNS]->(source:AGPublicEntity {graph_id: $graph_id})
+    MATCH (source)-[link:AG_PUBLIC_LINK {
+        graph_id: $graph_id,
+        relationship_id: $relationship_id
+    }]->(target:AGPublicEntity {graph_id: $graph_id})
+    WHERE EXISTS {
+        MATCH (graph)-[:AG_PUBLIC_OWNS]->(target)
+    }
+    SET link._authgraph_lock = true
+    REMOVE link._authgraph_lock
+    WITH link
+    WHERE coalesce(link.record_revision, 1) = $expected_revision
+    DELETE link
+    RETURN 1 AS deleted
     """
 
     _GET_PUBLIC_GRAPH_SNAPSHOT = """
@@ -125,7 +223,8 @@ class Neo4jPublicGraphRepository:
             RETURN {
                 entity_id: entity.entity_id,
                 kind: entity.kind,
-                properties_json: entity.properties_json
+                properties_json: entity.properties_json,
+                record_revision: coalesce(entity.record_revision, 1)
             } AS entity_row
         } AS entities,
         COLLECT {
@@ -147,7 +246,8 @@ class Neo4jPublicGraphRepository:
                 from_entity_id: source.entity_id,
                 to_entity_id: target.entity_id,
                 kind: link.kind,
-                properties_json: link.properties_json
+                properties_json: link.properties_json,
+                record_revision: coalesce(link.record_revision, 1)
             } AS relationship_row
         } AS relationships
     """
@@ -195,6 +295,13 @@ class Neo4jPublicGraphRepository:
     def _record_integer(cls, record: Any, name: str) -> int:
         value = cls._record_value(record, name)
         if type(value) is not int:
+            raise IntegrityViolation()
+        return value
+
+    @classmethod
+    def _record_revision(cls, record: Any) -> int:
+        value = cls._record_integer(record, "record_revision")
+        if value <= 0:
             raise IntegrityViolation()
         return value
 
@@ -264,14 +371,18 @@ class Neo4jPublicGraphRepository:
             properties=cls._decode_properties(
                 cls._record_text(record, "properties_json")
             ),
+            record_revision=cls._record_revision(record),
         )
 
     def put_public_entity(self, row: PublicEntityRow) -> bool:
+        if type(row.record_revision) is not int or row.record_revision != 1:
+            return False
         parameters = {
             "graph_id": row.graph_id,
             "entity_id": row.entity_id,
             "kind": row.kind,
             "properties_json": self._encode_properties(row.properties),
+            "record_revision": row.record_revision,
         }
         try:
             first = self._first(
@@ -301,6 +412,67 @@ class Neo4jPublicGraphRepository:
             return None
         return self._entity_from_record(graph_id, entity_id, first)
 
+    def replace_public_entity(
+        self,
+        graph_id: str,
+        entity_id: str,
+        expected_revision: int,
+        row: PublicEntityRow,
+    ) -> bool:
+        if (
+            type(expected_revision) is not int
+            or expected_revision <= 0
+            or row.graph_id != graph_id
+            or row.entity_id != entity_id
+            or row.record_revision != expected_revision + 1
+        ):
+            return False
+        parameters = {
+            "graph_id": graph_id,
+            "entity_id": entity_id,
+            "expected_revision": expected_revision,
+            "kind": row.kind,
+            "properties_json": self._encode_properties(row.properties),
+            "record_revision": row.record_revision,
+        }
+        try:
+            first = self._first(
+                self._execute(self._REPLACE_PUBLIC_ENTITY, **parameters)
+            )
+        except IncompleteCommit:
+            if self.get_public_entity(graph_id, entity_id) == row:
+                return True
+            raise
+        if first is not None and self._record_integer(first, "updated") == 1:
+            return True
+        return self.get_public_entity(graph_id, entity_id) == row
+
+    def delete_public_entity(
+        self,
+        graph_id: str,
+        entity_id: str,
+        expected_revision: int,
+    ) -> bool:
+        if type(expected_revision) is not int or expected_revision <= 0:
+            return False
+        try:
+            first = self._first(
+                self._execute(
+                    self._DELETE_PUBLIC_ENTITY,
+                    graph_id=graph_id,
+                    entity_id=entity_id,
+                    expected_revision=expected_revision,
+                )
+            )
+        except IncompleteCommit:
+            if self.get_public_entity(graph_id, entity_id) is None:
+                return True
+            raise
+        return (
+            first is not None
+            and self._record_integer(first, "deleted") == 1
+        )
+
     @classmethod
     def _relationship_from_record(
         cls,
@@ -319,9 +491,12 @@ class Neo4jPublicGraphRepository:
             properties=cls._decode_properties(
                 cls._record_text(record, "properties_json")
             ),
+            record_revision=cls._record_revision(record),
         )
 
     def put_public_relationship(self, row: PublicRelationshipRow) -> bool:
+        if type(row.record_revision) is not int or row.record_revision != 1:
+            return False
         parameters = {
             "graph_id": row.graph_id,
             "relationship_id": row.relationship_id,
@@ -329,40 +504,112 @@ class Neo4jPublicGraphRepository:
             "to_entity_id": row.to_entity_id,
             "kind": row.kind,
             "properties_json": self._encode_properties(row.properties),
+            "record_revision": row.record_revision,
         }
         try:
             first = self._first(
                 self._execute(self._PUT_PUBLIC_RELATIONSHIP, **parameters)
             )
         except IncompleteCommit:
-            if self._get_public_relationship(row) == row:
+            if self.get_public_relationship(
+                row.graph_id,
+                row.relationship_id,
+            ) == row:
                 return True
             raise
         if first is not None and self._record_integer(first, "created") == 1:
             return True
-        return self._get_public_relationship(row) == row
+        return self.get_public_relationship(
+            row.graph_id,
+            row.relationship_id,
+        ) == row
 
-    def _get_public_relationship(
+    def get_public_relationship(
         self,
-        row: PublicRelationshipRow,
+        graph_id: str,
+        relationship_id: str,
     ) -> PublicRelationshipRow | None:
         first = self._first(
             self._execute(
                 self._GET_PUBLIC_RELATIONSHIP,
-                graph_id=row.graph_id,
-                relationship_id=row.relationship_id,
-                from_entity_id=row.from_entity_id,
-                to_entity_id=row.to_entity_id,
+                graph_id=graph_id,
+                relationship_id=relationship_id,
             )
         )
         if first is None:
             return None
         return self._relationship_from_record(
-            row.graph_id,
-            row.relationship_id,
-            row.from_entity_id,
-            row.to_entity_id,
+            graph_id,
+            relationship_id,
+            self._record_text(first, "from_entity_id"),
+            self._record_text(first, "to_entity_id"),
             first,
+        )
+
+    def replace_public_relationship(
+        self,
+        graph_id: str,
+        relationship_id: str,
+        expected_revision: int,
+        row: PublicRelationshipRow,
+    ) -> bool:
+        if (
+            type(expected_revision) is not int
+            or expected_revision <= 0
+            or row.graph_id != graph_id
+            or row.relationship_id != relationship_id
+            or row.record_revision != expected_revision + 1
+        ):
+            return False
+        parameters = {
+            "graph_id": graph_id,
+            "relationship_id": relationship_id,
+            "from_entity_id": row.from_entity_id,
+            "to_entity_id": row.to_entity_id,
+            "expected_revision": expected_revision,
+            "kind": row.kind,
+            "properties_json": self._encode_properties(row.properties),
+            "record_revision": row.record_revision,
+        }
+        try:
+            first = self._first(
+                self._execute(
+                    self._REPLACE_PUBLIC_RELATIONSHIP,
+                    **parameters,
+                )
+            )
+        except IncompleteCommit:
+            if self.get_public_relationship(graph_id, relationship_id) == row:
+                return True
+            raise
+        if first is not None and self._record_integer(first, "updated") == 1:
+            return True
+        return self.get_public_relationship(graph_id, relationship_id) == row
+
+    def delete_public_relationship(
+        self,
+        graph_id: str,
+        relationship_id: str,
+        expected_revision: int,
+    ) -> bool:
+        if type(expected_revision) is not int or expected_revision <= 0:
+            return False
+        try:
+            first = self._first(
+                self._execute(
+                    self._DELETE_PUBLIC_RELATIONSHIP,
+                    graph_id=graph_id,
+                    relationship_id=relationship_id,
+                    expected_revision=expected_revision,
+                )
+            )
+        except IncompleteCommit:
+            if self.get_public_relationship(graph_id, relationship_id) is None:
+                return True
+            raise
+        return (
+            first is not None
+            and self._record_integer(first, "deleted") == 1
         )
 
     def get_public_graph_snapshot(

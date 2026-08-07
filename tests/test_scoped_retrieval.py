@@ -3,7 +3,11 @@ from __future__ import annotations
 import unittest
 
 from authgraph import CryptoEngine, InMemoryGraphRepository, KdfParameters
-from authgraph.errors import IntegrityViolation, SessionUnavailable
+from authgraph.errors import (
+    IntegrityViolation,
+    SessionUnavailable,
+    ValidationError,
+)
 from authgraph.models import (
     LayeredEntity,
     LayeredGraphView,
@@ -14,6 +18,7 @@ from authgraph.models import (
 from authgraph.retrieval import (
     DisclosurePolicy,
     RetrievalSource,
+    SessionBoundRetrievalTool,
     SessionVisibleGraphGateway,
 )
 from authgraph.scoped_retrieval import ScopedGraphViewAdapter
@@ -47,13 +52,36 @@ class StaticPublicProvider:
         return self.view
 
 
+class CountingGraphRepository(InMemoryGraphRepository):
+    def __init__(self) -> None:
+        super().__init__()
+        self.full_snapshot_reads = 0
+        self.targeted_snapshot_reads = 0
+        self.targeted_requests: list[
+            tuple[tuple[str, ...], tuple[str, ...]]
+        ] = []
+
+    def get_scoped_vault_snapshot(self, *args, **kwargs):
+        self.full_snapshot_reads += 1
+        return super().get_scoped_vault_snapshot(*args, **kwargs)
+
+    def get_scoped_targeted_snapshot(
+        self,
+        *args,
+        **kwargs,
+    ):
+        self.targeted_snapshot_reads += 1
+        self.targeted_requests.append((args[4], args[5]))
+        return super().get_scoped_targeted_snapshot(*args, **kwargs)
+
+
 class ScopedGraphRagIntegrationTests(unittest.TestCase):
     PRINCIPAL = "idp|graphrag-owner"
     PASSPHRASE = bytearray(b"synthetic graphrag owner password")
 
     def setUp(self) -> None:
         self.clock = FakeClock()
-        self.repository = InMemoryGraphRepository()
+        self.repository = CountingGraphRepository()
         self.sessions = ScopedSessionBroker(
             default_ttl_seconds=60,
             max_ttl_seconds=300,
@@ -291,6 +319,129 @@ class ScopedGraphRagIntegrationTests(unittest.TestCase):
         self.assertEqual(len(embedded_documents), 1)
         self.assertIn("TRACK-1", embedded_documents[0])
         self.assertNotIn("Benjamin", embedded_documents[0])
+        self.service.lock(context)
+
+    def test_candidate_index_builds_once_then_uses_only_targeted_reads(
+        self,
+    ) -> None:
+        context = self.unlock(
+            self.profile_scope,
+            self.orders_scope,
+            self.relationship_scope,
+        )
+        with self.gateway.build_candidate_index(context=context) as index:
+            self.assertEqual(self.repository.full_snapshot_reads, 1)
+            first = self.gateway.retrieve(
+                "delayed order",
+                context=context,
+                candidate_index=index,
+            )
+            second = self.gateway.retrieve(
+                "delayed order",
+                context=context,
+                candidate_index=index,
+            )
+            tool = SessionBoundRetrievalTool(
+                self.gateway,
+                context=context,
+                candidate_index=index,
+            )
+            third = tool.search("delayed order")
+            self.assertEqual(first, second)
+            self.assertEqual(second, third)
+            self.assertEqual(
+                [entity.entity_id for entity in first.entities],
+                [self.order_id, self.profile_id],
+            )
+            self.assertEqual(
+                [row.relationship_id for row in first.relationships],
+                [self.relationship_id],
+            )
+            self.assertEqual(self.repository.full_snapshot_reads, 1)
+            self.assertEqual(self.repository.targeted_snapshot_reads, 3)
+            for entity_ids, relationship_ids in (
+                self.repository.targeted_requests
+            ):
+                self.assertEqual(
+                    set(entity_ids),
+                    {self.profile_id, self.order_id},
+                )
+                self.assertEqual(
+                    relationship_ids,
+                    (self.relationship_id,),
+                )
+        self.service.lock(context)
+
+    def test_candidate_index_is_exact_context_bound_and_never_falls_back(
+        self,
+    ) -> None:
+        context = self.unlock(self.orders_scope)
+        other_context = self.unlock(self.orders_scope)
+        index = self.gateway.build_candidate_index(context=context)
+        self.addCleanup(index.close)
+        with self.assertRaisesRegex(ValidationError, "Candidate index"):
+            self.gateway.retrieve(
+                "delayed",
+                context=other_context,
+                candidate_index=index,
+            )
+        other_gateway = SessionVisibleGraphGateway(
+            self.adapter,
+            graph_id="owner-knowledge",
+            policy=self.gateway.policy,
+        )
+        with self.assertRaisesRegex(ValidationError, "Candidate index"):
+            other_gateway.retrieve(
+                "delayed",
+                context=context,
+                candidate_index=index,
+            )
+        self.assertEqual(self.repository.targeted_snapshot_reads, 0)
+
+        self.service.lock(context)
+        with self.assertRaises(SessionUnavailable):
+            self.gateway.retrieve(
+                "delayed",
+                context=context,
+                candidate_index=index,
+            )
+        self.assertEqual(self.repository.targeted_snapshot_reads, 0)
+        self.service.lock(other_context)
+
+        expiring = self.unlock(
+            self.orders_scope,
+            ttl_seconds=2,
+        )
+        expiring_index = self.gateway.build_candidate_index(
+            context=expiring
+        )
+        self.addCleanup(expiring_index.close)
+        self.clock.advance(3)
+        with self.assertRaises(SessionUnavailable):
+            self.gateway.retrieve(
+                "delayed",
+                context=expiring,
+                candidate_index=expiring_index,
+            )
+        self.assertEqual(self.repository.targeted_snapshot_reads, 0)
+
+    def test_memory_targeted_snapshot_requires_every_relationship_scope(
+        self,
+    ) -> None:
+        context = self.unlock(
+            self.orders_scope,
+            self.relationship_scope,
+        )
+        snapshot = self.service.get_targeted_snapshot(
+            context,
+            (self.order_id,),
+            (self.relationship_id,),
+        )
+        self.assertEqual(
+            [entity.entity_id for entity in snapshot.entities],
+            [self.order_id],
+        )
+        self.assertEqual(snapshot.relationships, ())
         self.service.lock(context)
 
     def test_public_view_rejects_duplicate_entity_ids(self) -> None:

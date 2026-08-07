@@ -1,0 +1,119 @@
+name: Live Neo4j
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/live-neo4j.yml"
+      - "neo4j/**"
+      - "scripts/ci/start-neo4j-tls.sh"
+      - "src/authgraph/**"
+      - "tests/integration/**"
+  push:
+    branches: [main]
+    tags: ["v*"]
+    paths:
+      - ".github/workflows/live-neo4j.yml"
+      - "neo4j/**"
+      - "scripts/ci/start-neo4j-tls.sh"
+      - "src/authgraph/**"
+      - "tests/integration/**"
+  schedule:
+    - cron: "23 4 * * 2"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: live-neo4j-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  live:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: neo4j-5.7-minimum
+            id: neo4j-5-7
+            image: neo4j:5.7.0
+            python: "3.11"
+            minimum_dependencies: true
+          - name: neo4j-5.26
+            id: neo4j-5-26
+            image: neo4j:5.26.29
+            python: "3.14"
+            minimum_dependencies: false
+          - name: neo4j-2026.06
+            id: neo4j-2026-06
+            image: neo4j:2026.06.0
+            python: "3.14"
+            minimum_dependencies: false
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+      - name: Install minimum dependencies
+        if: matrix.minimum_dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "cryptography==44.0.0" "neo4j==6.2.0"
+          python -m pip install --no-deps .
+      - name: Install current dependencies
+        if: matrix.minimum_dependencies == false
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install .
+      - name: Create an ephemeral test password
+        shell: bash
+        run: |
+          umask 077
+          neo4j_test_password=$(openssl rand -hex 32)
+          printf '%s\n' "$neo4j_test_password" >"$RUNNER_TEMP/neo4j-password"
+          echo "::add-mask::$neo4j_test_password"
+          echo "AUTHGRAPH_CI_NEO4J_PASSWORD_FILE=$RUNNER_TEMP/neo4j-password" >>"$GITHUB_ENV"
+      - name: Start Neo4j with required TLS
+        shell: bash
+        env:
+          AUTHGRAPH_NEO4J_JOB_ID: ${{ matrix.id }}
+        run: |
+          bash scripts/ci/start-neo4j-tls.sh \
+            "${{ matrix.image }}" \
+            "$AUTHGRAPH_CI_NEO4J_PASSWORD_FILE"
+      - name: Apply and verify the packaged schema through the installed CLI
+        run: |
+          authgraph schema apply \
+            --uri "$AUTHGRAPH_TEST_NEO4J_URI" \
+            --database "$AUTHGRAPH_TEST_NEO4J_DATABASE" \
+            --username "$AUTHGRAPH_TEST_NEO4J_USERNAME" \
+            --password-file "$AUTHGRAPH_TEST_NEO4J_PASSWORD_FILE" \
+            --no-input
+          authgraph schema verify \
+            --uri "$AUTHGRAPH_TEST_NEO4J_URI" \
+            --database "$AUTHGRAPH_TEST_NEO4J_DATABASE" \
+            --username "$AUTHGRAPH_TEST_NEO4J_USERNAME" \
+            --password-file "$AUTHGRAPH_TEST_NEO4J_PASSWORD_FILE" \
+            --no-input
+      - name: Run live integration tests
+        env:
+          AUTHGRAPH_RUN_NEO4J_TESTS: "1"
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: python -X dev -m unittest discover -s tests/integration -v
+      - name: Show Neo4j logs after a failure
+        if: failure() && env.AUTHGRAPH_NEO4J_CONTAINER != ''
+        run: docker logs "$AUTHGRAPH_NEO4J_CONTAINER"
+      - name: Remove the exact CI container and certificate volume
+        if: always()
+        shell: bash
+        run: |
+          if [[ -n "${AUTHGRAPH_NEO4J_CONTAINER:-}" ]]; then
+            docker rm --force "$AUTHGRAPH_NEO4J_CONTAINER" >/dev/null 2>&1 || true
+          fi
+          if [[ -n "${AUTHGRAPH_NEO4J_CERTIFICATE_VOLUME:-}" ]]; then
+            docker volume rm --force "$AUTHGRAPH_NEO4J_CERTIFICATE_VOLUME" >/dev/null 2>&1 || true
+          fi
